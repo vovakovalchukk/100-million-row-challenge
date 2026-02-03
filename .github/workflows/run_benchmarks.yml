@@ -34,16 +34,15 @@ jobs:
       - name: Adding Known Hosts
         run: ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Determine branch + remote (supports PRs from forks)
-        id: gitvars
+      - name: Determine branch + fetch ref
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "BRANCH=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_ENV"
-            echo "REMOTE_URL=${{ github.event.pull_request.head.repo.clone_url }}" >> "$GITHUB_ENV"
+            echo "BRANCH=${{ github.head_ref }}" >> "$GITHUB_ENV"
+            echo "FETCH_REF=refs/pull/${{ github.event.pull_request.number }}/head" >> "$GITHUB_ENV"
           else
             echo "BRANCH=${{ github.ref_name }}" >> "$GITHUB_ENV"
-            echo "REMOTE_URL=${{ github.server_url }}/${{ github.repository }}.git" >> "$GITHUB_ENV"
+            echo "FETCH_REF=refs/heads/${{ github.ref_name }}" >> "$GITHUB_ENV"
           fi
 
       - name: Checkout code on server
@@ -51,20 +50,14 @@ jobs:
         run: |
           ssh "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "bash -lc '
             set -euo pipefail
-
             cd ~/benchmark
-
-            # Ensure main is up to date
-            git switch main || git checkout main
-            git fetch origin
-            git pull --ff-only origin main
-
-            # For pull requests, fetch the PR head ref from origin (works for forks too)
-            PR_NUMBER=\"${{ github.event.pull_request.number }}\"
-            BRANCH=\"pr-${{ github.event.pull_request.number }}\"
-
-            git fetch --prune origin \"refs/pull/${PR_NUMBER}/head:${BRANCH}\"
-            git switch \"${BRANCH}\" || git checkout \"${BRANCH}\"
+          
+            git fetch --prune origin
+            git checkout main
+            git pull origin main
+            git branch -D \"$BRANCH\" 2>/dev/null || true
+            git fetch origin \"$FETCH_REF:$BRANCH\"
+            git checkout \"$BRANCH\"
           '"
 
       - name: Run benchmark
