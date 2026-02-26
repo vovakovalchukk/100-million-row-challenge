@@ -242,19 +242,16 @@ final class Parser
 
         for ($p = 0; $p < $pathCount; $p++) {
             $base      = $p * $dateCount;
-            $dateBuf   = '';
-            $firstDate = true;
+            $dateParts = [];
 
             for ($d = 0; $d < $dateCount; $d++) {
                 $count = $counts[$base + $d];
-                if ($count === 0) continue;
-
-                if (!$firstDate) $dateBuf .= ",\n";
-                $firstDate = false;
-                $dateBuf  .= '        "20' . $dates[$d] . '": ' . $count;
+                if ($count !== 0) {
+                    $dateParts[] = '        "20' . $dates[$d] . '": ' . $count;
+                }
             }
 
-            if ($firstDate) continue;
+            if (empty($dateParts)) continue;
 
             $sep       = $firstPath ? '' : ',';
             $firstPath = false;
@@ -262,7 +259,7 @@ final class Parser
             fwrite($out,
                 $sep .
                 "\n    \"\\/blog\\/" . str_replace('/', '\\/', $paths[$p]) . "\": {\n" .
-                $dateBuf .
+                implode(",\n", $dateParts) .
                 "\n    }"
             );
         }
