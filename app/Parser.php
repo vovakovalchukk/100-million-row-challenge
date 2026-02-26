@@ -29,9 +29,9 @@ final class Parser
     {
         ini_set('memory_limit', '-1');
 
-        $chunks = $this->getChunks($inputPath);
-        $tmpDir = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
-        $pid    = getmypid();
+        $chunks  = $this->getChunks($inputPath);
+        $tmpDir  = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+        $pid     = getmypid();
 
         $tempFiles = [];
         for ($i = 0; $i < self::WORKER_COUNT; $i++) {
@@ -48,12 +48,7 @@ final class Parser
 
             if ($fork === 0) {
                 ini_set('memory_limit', '-1');
-                $this->runWorker(
-                    $inputPath,
-                    $chunks[$i][0],
-                    $chunks[$i][1],
-                    $tempFiles[$i],
-                );
+                $this->runWorker($inputPath, $chunks[$i][0], $chunks[$i][1], $tempFiles[$i]);
                 exit(0);
             }
 
@@ -69,7 +64,7 @@ final class Parser
                         unlink($f);
                     }
                 }
-                throw new \RuntimeException("Worker exited with error status: $status");
+                throw new \RuntimeException('Worker process failed');
             }
         }
 
@@ -115,10 +110,16 @@ final class Parser
 
         fseek($handle, $start);
 
+        $readChunk  = $this->readChunk;
+        $domainLen  = self::DOMAIN_LEN;
+        $tsLen      = self::TS_LEN;
+        $dateLen    = self::DATE_LEN;
+        $minLen     = $domainLen + $tsLen;
+
         $leftover = '';
 
         while ($remaining > 0) {
-            $raw = fread($handle, min($this->readChunk, $remaining));
+            $raw = fread($handle, min($readChunk, $remaining));
 
             if ($raw === false || $raw === '') {
                 break;
@@ -136,18 +137,13 @@ final class Parser
                     continue;
                 }
 
-                $line     = $leftover . substr($raw, 0, $nl);
-                $lineLen  = strlen($line);
+                $line    = $leftover . substr($raw, 0, $nl);
+                $lineEnd = strlen($line);
                 $leftover = '';
 
-                if ($lineLen > 0 && $line[$lineLen - 1] === "\r") {
-                    $lineLen--;
-                }
-
-                if ($lineLen > self::DOMAIN_LEN + self::TS_LEN) {
-                    $date = substr($line, $lineLen - self::TS_LEN, self::DATE_LEN);
-                    $path = substr($line, self::DOMAIN_LEN,
-                        $lineLen - self::DOMAIN_LEN - self::TS_LEN - 1);
+                if ($lineEnd > $minLen) {
+                    $date = substr($line, $lineEnd - $tsLen, $dateLen);
+                    $path = substr($line, $domainLen, $lineEnd - $domainLen - $tsLen - 1);
 
                     $cell = &$data[$path][$date];
                     $cell !== null ? $cell++ : ($cell = 1);
@@ -165,16 +161,10 @@ final class Parser
                     break;
                 }
 
-                $lineLen = $nl - $pos;
+                if ($nl - $pos > $minLen) {
+                    $date = substr($raw, $nl - $tsLen, $dateLen);
 
-                if ($lineLen > 0 && $raw[$pos + $lineLen - 1] === "\r") {
-                    $lineLen--;
-                }
-
-                if ($lineLen > self::DOMAIN_LEN + self::TS_LEN) {
-                    $date = substr($raw, $pos + $lineLen - self::TS_LEN, self::DATE_LEN);
-                    $path = substr($raw, $pos + self::DOMAIN_LEN,
-                        $lineLen - self::DOMAIN_LEN - self::TS_LEN - 1);
+                    $path = substr($raw, $pos + $domainLen, $nl - $pos - $domainLen - $tsLen - 1);
 
                     $cell = &$data[$path][$date];
                     $cell !== null ? $cell++ : ($cell = 1);
@@ -185,18 +175,12 @@ final class Parser
             }
         }
 
-        // last line
         if ($leftover !== '') {
-            $lineLen = strlen($leftover);
+            $lineEnd = strlen($leftover);
 
-            if ($lineLen > 0 && $leftover[$lineLen - 1] === "\r") {
-                $lineLen--;
-            }
-
-            if ($lineLen > self::DOMAIN_LEN + self::TS_LEN) {
-                $date = substr($leftover, $lineLen - self::TS_LEN, self::DATE_LEN);
-                $path = substr($leftover, self::DOMAIN_LEN,
-                    $lineLen - self::DOMAIN_LEN - self::TS_LEN - 1);
+            if ($lineEnd > $minLen) {
+                $date = substr($leftover, $lineEnd - $tsLen, $dateLen);
+                $path = substr($leftover, $domainLen, $lineEnd - $domainLen - $tsLen - 1);
 
                 $cell = &$data[$path][$date];
                 $cell !== null ? $cell++ : ($cell = 1);
@@ -210,29 +194,37 @@ final class Parser
 
     private function writeJson(array $result, string $outputPath): void
     {
-        $out = fopen($outputPath, 'wb');
-        $buf = "{\n";
+        $out    = fopen($outputPath, 'wb');
+        $buf    = "{\n";
+        $bufLen = 2;
 
         $pathCount = count($result);
         $pathIdx   = 0;
 
         foreach ($result as $path => $dates) {
-            $esc  = str_replace('/', '\\/', $path);
-            $buf .= "    \"$esc\": {\n";
+            $esc     = str_replace('/', '\\/', $path);
+            $header  = "    \"$esc\": {\n";
+            $buf    .= $header;
+            $bufLen += strlen($header);
 
             $dateCount = count($dates);
             $dateIdx   = 0;
 
             foreach ($dates as $date => $count) {
-                $buf .= "        \"$date\": $count";
-                $buf .= (++$dateIdx < $dateCount) ? ",\n" : "\n";
+                $line    = "        \"$date\": $count";
+                $line   .= (++$dateIdx < $dateCount) ? ",\n" : "\n";
+                $buf    .= $line;
+                $bufLen += strlen($line);
             }
 
-            $buf .= (++$pathIdx < $pathCount) ? "    },\n" : "    }\n";
+            $closing  = (++$pathIdx < $pathCount) ? "    },\n" : "    }\n";
+            $buf     .= $closing;
+            $bufLen  += strlen($closing);
 
-            if (strlen($buf) >= self::WRITE_BUFFER) {
+            if ($bufLen >= self::WRITE_BUFFER) {
                 fwrite($out, $buf);
-                $buf = '';
+                $buf    = '';
+                $bufLen = 0;
             }
         }
 
