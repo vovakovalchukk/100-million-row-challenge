@@ -6,8 +6,7 @@ namespace App;
 
 final class Parser
 {
-    private const int WORKERS       = 8;
-    private const int BUFFER_SIZE   = 4 * 1024 * 1024;
+    private const int BUFFER_SIZE   = 8 * 1024 * 1024;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
 
     private const int PREFIX_LEN  = 25;
@@ -21,6 +20,12 @@ final class Parser
         ini_set('memory_limit', '-1');
 
         $fileSize = filesize($inputPath);
+
+        if (PHP_OS_FAMILY === 'Darwin') {
+            $numWorkers = 8;
+        } else {
+            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
+        }
 
         $dateIds   = [];
         $dates     = [];
@@ -85,8 +90,8 @@ final class Parser
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
-        for ($i = 1; $i < self::WORKERS; $i++) {
-            fseek($bh, (int)($fileSize * $i / self::WORKERS));
+        for ($i = 1; $i < $numWorkers; $i++) {
+            fseek($bh, (int)($fileSize * $i / $numWorkers));
             fgets($bh);
             $splitPoints[] = ftell($bh);
         }
@@ -97,7 +102,7 @@ final class Parser
         $myPid    = getmypid();
         $children = [];
 
-        for ($w = 0; $w < self::WORKERS - 1; $w++) {
+        for ($w = 0; $w < $numWorkers - 1; $w++) {
             $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $w;
             $pid     = pcntl_fork();
             if ($pid === -1) throw new \RuntimeException('pcntl_fork failed');
@@ -120,19 +125,25 @@ final class Parser
 
         $counts = $this->parseRange(
             $inputPath,
-            $splitPoints[self::WORKERS - 1],
-            $splitPoints[self::WORKERS],
+            $splitPoints[$numWorkers - 1],
+            $splitPoints[$numWorkers],
             $pathIds, $dateIds, $pathCount, $dateCount, $strposHint,
         );
 
         $pending = $children;
+        $n       = $pathCount * $dateCount;
+
         while (!empty($pending)) {
             $anyDone = false;
 
             foreach ($pending as $key => [$cpid, $tmpFile]) {
                 $ret = pcntl_waitpid($cpid, $status, WNOHANG);
                 if ($ret > 0) {
-                    $this->mergeCounts($counts, $tmpFile);
+                    $wCounts = unpack('V*', file_get_contents($tmpFile));
+                    unlink($tmpFile);
+                    for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
+                        $counts[$j] += $wCounts[$k];
+                    }
                     unset($pending[$key]);
                     $anyDone = true;
                     break;
@@ -144,7 +155,11 @@ final class Parser
                 $key              = key($pending);
                 [$cpid, $tmpFile] = $pending[$key];
                 pcntl_waitpid($cpid, $status);
-                $this->mergeCounts($counts, $tmpFile);
+                $wCounts = unpack('V*', file_get_contents($tmpFile));
+                unlink($tmpFile);
+                for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
+                    $counts[$j] += $wCounts[$k];
+                }
                 unset($pending[$key]);
             }
         }
@@ -174,6 +189,7 @@ final class Parser
         $suffixLen  = self::SUFFIX_LEN;
         $dateOffset = self::DATE_OFFSET;
         $dateLen    = self::DATE_LEN;
+        $leftover   = '';
 
         while ($remaining > 0) {
             $toRead = $remaining > $bufSize ? $bufSize : $remaining;
@@ -196,6 +212,18 @@ final class Parser
                 $remaining += $tail;
             }
 
+            if ($leftover !== '') {
+                $nl      = strpos($chunk, "\n");
+                $line    = $leftover . substr($chunk, 0, $nl);
+                $lineLen = strlen($line);
+                $leftover = '';
+
+                $counts[
+                $pathIds[substr($line, $prefixLen, $lineLen - $prefixLen - $suffixLen)]
+                + $dateIds[substr($line, $lineLen - $dateOffset, $dateLen)]
+                ]++;
+            }
+
             $pos = 0;
 
             while ($pos < $lastNl) {
@@ -208,21 +236,12 @@ final class Parser
 
                 $pos = $nl + 1;
             }
+
+            $leftover = $tail > 0 ? '' : substr($chunk, $lastNl + 1);
         }
 
         fclose($handle);
         return $counts;
-    }
-
-    private function mergeCounts(array &$counts, string $tmpFile): void
-    {
-        $wCounts = unpack('V*', file_get_contents($tmpFile));
-        unlink($tmpFile);
-
-        $n = count($counts);
-        for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
-            $counts[$j] += $wCounts[$k];
-        }
     }
 
     private function writeJson(
