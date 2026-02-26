@@ -10,11 +10,8 @@ final class Parser
 {
     private const int BUFFER_SIZE   = 8 * 1024 * 1024;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
-
-    private const int PREFIX_LEN  = 25;
-    private const int SUFFIX_LEN  = 26;
-    private const int DATE_OFFSET = 23;
-    private const int DATE_LEN    = 8;
+    private const int PREFIX_LEN    = 25;
+    private const int SUFFIX_LEN    = 26;
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -26,16 +23,18 @@ final class Parser
         if (PHP_OS_FAMILY === 'Darwin') {
             $numWorkers = 8;
         } else {
-            $numWorkers = 10;
+            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
         }
 
-        $dateIds   = [];
-        $dates     = [];
-        $dateCount = 0;
+        $monthDayOffset = [];
+        $dates          = [];
+        $dateCount      = 0;
 
         for ($y = 20; $y <= 27; $y++) {
+            $yi   = $y - 20;
             $yStr = (string)$y;
             for ($m = 1; $m <= 12; $m++) {
+                $mi   = $m - 1;
                 $maxD = match ($m) {
                     2           => (($y + 2000) % 4 === 0) ? 29 : 28,
                     4, 6, 9, 11 => 30,
@@ -43,13 +42,19 @@ final class Parser
                 };
                 $mStr  = ($m < 10 ? '0' : '') . $m;
                 $ymStr = $yStr . '-' . $mStr . '-';
+
+                $monthDayOffset[$yi][$mi] = $dateCount;
+
                 for ($d = 1; $d <= $maxD; $d++) {
-                    $key               = $ymStr . (($d < 10 ? '0' : '') . $d);
-                    $dateIds[$key]     = $dateCount;
-                    $dates[$dateCount] = $key;
-                    $dateCount++;
+                    $dates[$dateCount++] = $ymStr . (($d < 10 ? '0' : '') . $d);
                 }
             }
+        }
+
+        // 730 × ~40 bytes = ~29KB
+        $dateBytes = [];
+        for ($d = 0; $d < $dateCount; $d++) {
+            $dateBytes[$d] = chr($d & 0xFF) . chr($d >> 8);
         }
 
         $handle = fopen($inputPath, 'rb');
@@ -78,7 +83,7 @@ final class Parser
             }
 
             if (!isset($pathIds[$slug])) {
-                $pathIds[$slug]    = $pathCount * $dateCount;
+                $pathIds[$slug]    = $pathCount;
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
@@ -96,7 +101,7 @@ final class Parser
             }
 
             if (!isset($pathIds[$slug])) {
-                $pathIds[$slug]    = $pathCount * $dateCount;
+                $pathIds[$slug]    = $pathCount;
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
@@ -127,9 +132,10 @@ final class Parser
                 gc_disable();
                 ini_set('memory_limit', '-1');
 
-                $wCounts = $this->parseRange(
+                $wCounts = $this->processChunk(
                     $inputPath, $splitPoints[$w], $splitPoints[$w + 1],
-                    $pathIds, $dateIds, $pathCount, $dateCount, $strposHint,
+                    $pathIds, $monthDayOffset, $dateBytes,
+                    $pathCount, $dateCount, $strposHint,
                 );
 
                 file_put_contents($tmpFile, pack('V*', ...$wCounts));
@@ -139,11 +145,12 @@ final class Parser
             $children[] = [$pid, $tmpFile];
         }
 
-        $counts = $this->parseRange(
+        $counts = $this->processChunk(
             $inputPath,
             $splitPoints[$numWorkers - 1],
             $splitPoints[$numWorkers],
-            $pathIds, $dateIds, $pathCount, $dateCount, $strposHint,
+            $pathIds, $monthDayOffset, $dateBytes,
+            $pathCount, $dateCount, $strposHint,
         );
 
         $pending = $children;
@@ -183,17 +190,18 @@ final class Parser
         $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private function parseRange(
+    private function processChunk(
         string $inputPath,
         int    $start,
         int    $end,
         array  $pathIds,
-        array  $dateIds,
+        array  $monthDayOffset,
+        array  $dateBytes,
         int    $pathCount,
         int    $dateCount,
         int    $strposHint,
     ): array {
-        $counts    = array_fill(0, $pathCount * $dateCount, 0);
+        $buckets   = array_fill(0, $pathCount, '');
         $handle    = fopen($inputPath, 'rb');
         $remaining = $end - $start;
 
@@ -203,8 +211,6 @@ final class Parser
         $bufSize    = self::BUFFER_SIZE;
         $prefixLen  = self::PREFIX_LEN;
         $suffixLen  = self::SUFFIX_LEN;
-        $dateOffset = self::DATE_OFFSET;
-        $dateLen    = self::DATE_LEN;
         $leftover   = '';
 
         while ($remaining > 0) {
@@ -234,10 +240,12 @@ final class Parser
                 $lineLen = strlen($line);
                 $leftover = '';
 
-                $counts[
-                $pathIds[substr($line, $prefixLen, $lineLen - $prefixLen - $suffixLen)]
-                + $dateIds[substr($line, $lineLen - $dateOffset, $dateLen)]
-                ]++;
+                $buckets[$pathIds[substr($line, $prefixLen, $lineLen - $prefixLen - $suffixLen)]]
+                    .= $dateBytes[
+                $monthDayOffset[ord($line[$lineLen - 22]) - 48]
+                [(ord($line[$lineLen - 20]) - 48) * 10 + ord($line[$lineLen - 19]) - 49]
+                + (ord($line[$lineLen - 17]) - 48) * 10 + ord($line[$lineLen - 16]) - 49
+                ];
             }
 
             $pos = 0;
@@ -245,10 +253,12 @@ final class Parser
             while ($pos < $lastNl) {
                 $nl = strpos($chunk, "\n", $pos + $strposHint);
 
-                $counts[
-                $pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]
-                + $dateIds[substr($chunk, $nl - $dateOffset, $dateLen)]
-                ]++;
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]]
+                    .= $dateBytes[
+                $monthDayOffset[ord($chunk[$nl - 22]) - 48]
+                [(ord($chunk[$nl - 20]) - 48) * 10 + ord($chunk[$nl - 19]) - 49]
+                + (ord($chunk[$nl - 17]) - 48) * 10 + ord($chunk[$nl - 16]) - 49
+                ];
 
                 $pos = $nl + 1;
             }
@@ -257,6 +267,16 @@ final class Parser
         }
 
         fclose($handle);
+
+        $counts = array_fill(0, $pathCount * $dateCount, 0);
+        for ($p = 0; $p < $pathCount; $p++) {
+            if ($buckets[$p] === '') continue;
+            $offset = $p * $dateCount;
+            foreach (unpack('v*', $buckets[$p]) as $did) {
+                $counts[$offset + $did]++;
+            }
+        }
+
         return $counts;
     }
 
