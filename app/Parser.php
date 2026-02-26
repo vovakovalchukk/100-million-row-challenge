@@ -6,7 +6,7 @@ namespace App;
 
 final class Parser
 {
-    private const int WORKERS       = 10;
+    private const int WORKERS       = 8;
     private const int BUFFER_SIZE   = 4 * 1024 * 1024;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
 
