@@ -8,7 +8,8 @@ use App\Commands\Visit;
 
 final class Parser
 {
-    private const int BUFFER_SIZE = 8 * 1024 * 1024;
+    private const int BUFFER_SIZE   = 8 * 1024 * 1024;
+    private const int DISCOVER_SIZE = 2 * 1024 * 1024;
 
     private const int PREFIX_LEN  = 25;
     private const int SUFFIX_LEN  = 26;
@@ -51,10 +52,40 @@ final class Parser
             }
         }
 
+        $handle = fopen($inputPath, 'rb');
+        stream_set_read_buffer($handle, 0);
+        $raw = fread($handle, min(self::DISCOVER_SIZE, $fileSize));
+        fclose($handle);
+
         $pathIds    = [];
         $paths      = [];
         $pathCount  = 0;
         $minSlugLen = PHP_INT_MAX;
+        $pos        = 0;
+        $lastNl     = strrpos($raw, "\n") ?: 0;
+
+        while ($pos < $lastNl) {
+            $nl = strpos($raw, "\n", $pos + self::PREFIX_LEN + 1 + self::SUFFIX_LEN);
+            if ($nl === false) break;
+
+            $lineLen = $nl - $pos;
+            $slug    = substr($raw, $pos + self::PREFIX_LEN,
+                $lineLen - self::PREFIX_LEN - self::SUFFIX_LEN);
+            $slugLen = strlen($slug);
+
+            if ($slugLen < $minSlugLen) {
+                $minSlugLen = $slugLen;
+            }
+
+            if (!isset($pathIds[$slug])) {
+                $pathIds[$slug]    = $pathCount * $dateCount;
+                $paths[$pathCount] = $slug;
+                $pathCount++;
+            }
+
+            $pos = $nl + 1;
+        }
+        unset($raw);
 
         foreach (Visit::all() as $visit) {
             $slug    = substr($visit->uri, self::PREFIX_LEN);
