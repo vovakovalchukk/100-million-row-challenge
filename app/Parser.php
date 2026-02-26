@@ -23,11 +23,11 @@ final class Parser
 
         $fileSize = filesize($inputPath);
 
-        if (PHP_OS_FAMILY === 'Darwin') {
+//        if (PHP_OS_FAMILY === 'Darwin') {
             $numWorkers = 8;
-        } else {
-            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
-        }
+//        } else {
+//            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
+//        }
 
         $dateIds   = [];
         $dates     = [];
