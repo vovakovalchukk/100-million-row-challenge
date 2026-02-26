@@ -22,7 +22,6 @@ use function ftell;
 use function fwrite;
 use function gc_disable;
 use function getmypid;
-use function implode;
 use function ini_set;
 use function key;
 use function max;
@@ -106,8 +105,10 @@ final class Parser
         $pos        = 0;
         $lastNl     = strrpos($raw, "\n") ?: 0;
 
+        $discoverHint = self::PREFIX_LEN + 1 + self::SUFFIX_LEN;
+
         while ($pos < $lastNl) {
-            $nl = strpos($raw, "\n", $pos + self::PREFIX_LEN + 1 + self::SUFFIX_LEN);
+            $nl = strpos($raw, "\n", $pos + $discoverHint);
             if ($nl === false) break;
 
             $lineLen = $nl - $pos;
@@ -251,6 +252,8 @@ final class Parser
         $prefixLen  = self::PREFIX_LEN;
         $suffixLen  = self::SUFFIX_LEN;
 
+        $slugHint = $strposHint - $prefixLen;
+
         while ($remaining > 0) {
             $toRead = $remaining > $bufSize ? $bufSize : $remaining;
             $chunk  = fread($handle, $toRead);
@@ -272,40 +275,40 @@ final class Parser
                 $remaining += $tail;
             }
 
-            $pos      = 0;
-            $safeZone = $lastNl - $safeZoneOffset;
+            $slugPos      = $prefixLen;
+            $safeZoneSlug = $lastNl - $safeZoneOffset + $prefixLen;
 
-            while ($pos < $safeZone) {
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+            while ($slugPos < $safeZoneSlug) {
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
 
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
 
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
 
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
 
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
 
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
             }
 
-            while ($pos < $lastNl) {
-                $nl = strpos($chunk, "\n", $pos + $strposHint);
+            while ($slugPos < $lastNl) {
+                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
                 if ($nl === false) break;
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $pos = $nl + 1;
+                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $slugPos = $nl + $prefixLen + 1;
             }
         }
 
@@ -349,25 +352,26 @@ final class Parser
         $firstPath = true;
 
         for ($p = 0; $p < $pathCount; $p++) {
-            $base        = $p * $dateCount;
-            $dateEntries = [];
+            $base = $p * $dateCount;
+            $buf  = '';
+            $sep  = '';
 
             for ($d = 0; $d < $dateCount; $d++) {
                 $count = $counts[$base + $d];
-                if ($count !== 0) {
-                    $dateEntries[] = $datePrefixes[$d] . $count;
-                }
+                if ($count === 0) continue;
+                $buf .= $sep . $datePrefixes[$d] . $count;
+                $sep  = ",\n";
             }
 
-            if (empty($dateEntries)) continue;
+            if ($buf === '') continue;
 
-            $sep       = $firstPath ? '' : ',';
+            $sep2      = $firstPath ? '' : ',';
             $firstPath = false;
 
             fwrite($out,
-                $sep .
+                $sep2 .
                 "\n    " . $escapedPaths[$p] . ": {\n" .
-                implode(",\n", $dateEntries) .
+                $buf .
                 "\n    }"
             );
         }
