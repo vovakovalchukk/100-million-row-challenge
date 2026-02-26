@@ -19,12 +19,12 @@ final class Parser
         ini_set('memory_limit', '-1');
 
         $fileSize = filesize($inputPath);
-
-        if (PHP_OS_FAMILY === 'Darwin') {
-            $numWorkers = 8;
-        } else {
-            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
-        }
+        $numWorkers = 12;
+//        if (PHP_OS_FAMILY === 'Darwin') {
+//            $numWorkers = max(8, (int)trim(shell_exec('sysctl -n hw.ncpu') ?: '8'));
+//        } else {
+//            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
+//        }
 
         $dateIds   = [];
         $dates     = [];
