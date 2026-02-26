@@ -19,12 +19,9 @@ final class Parser
         ini_set('memory_limit', '-1');
 
         $fileSize = filesize($inputPath);
-        $numWorkers = 12;
-//        if (PHP_OS_FAMILY === 'Darwin') {
-//            $numWorkers = max(8, (int)trim(shell_exec('sysctl -n hw.ncpu') ?: '8'));
-//        } else {
-//            $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
-//        }
+
+        $numCpu     = max(1, (int)trim(shell_exec('sysctl -n hw.ncpu') ?: '8'));
+        $numWorkers = max(8, min(16, (int)($numCpu * 1.5)));
 
         $dateIds   = [];
         $dates     = [];
@@ -107,7 +104,7 @@ final class Parser
         if ($minSlugLen === PHP_INT_MAX) $minSlugLen = 5;
 
         $strposHint     = self::PREFIX_LEN + $minSlugLen + self::SUFFIX_LEN;
-        $safeZoneOffset = $maxLineLen * 5 + $strposHint;
+        $safeZoneOffset = $maxLineLen * 6;
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
@@ -119,7 +116,7 @@ final class Parser
         fclose($bh);
         $splitPoints[] = $fileSize;
 
-        $tmpDir   = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+        $tmpDir   = sys_get_temp_dir();
         $myPid    = getmypid();
         $children = [];
 
@@ -211,7 +208,6 @@ final class Parser
         $bufSize    = self::BUFFER_SIZE;
         $prefixLen  = self::PREFIX_LEN;
         $suffixLen  = self::SUFFIX_LEN;
-        $leftover   = '';
 
         while ($remaining > 0) {
             $toRead = $remaining > $bufSize ? $bufSize : $remaining;
@@ -232,15 +228,6 @@ final class Parser
             if ($tail > 0) {
                 fseek($handle, -$tail, SEEK_CUR);
                 $remaining += $tail;
-            }
-
-            if ($leftover !== '') {
-                $nl      = strpos($chunk, "\n");
-                $line    = $leftover . substr($chunk, 0, $nl);
-                $lineLen = strlen($line);
-                $leftover = '';
-                $buckets[$pathIds[substr($line, $prefixLen, $lineLen - $prefixLen - $suffixLen)]]
-                    .= $dateIdBytes[substr($line, $lineLen - 25, 8)];
             }
 
             $pos      = 0;
@@ -278,8 +265,6 @@ final class Parser
                 $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
                 $pos = $nl + 1;
             }
-
-            $leftover = $tail > 0 ? '' : substr($chunk, $lastNl + 1);
         }
 
         fclose($handle);
