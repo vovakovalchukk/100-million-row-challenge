@@ -111,7 +111,7 @@ final class Parser
                     $pathIds, $dateIds, $pathCount, $dateCount, $strposHint,
                 );
 
-                $this->writeCounts($tmpFile, $wCounts);
+                file_put_contents($tmpFile, pack('V*', ...$wCounts));
                 exit(0);
             }
 
@@ -125,9 +125,28 @@ final class Parser
             $pathIds, $dateIds, $pathCount, $dateCount, $strposHint,
         );
 
-        foreach ($children as [$cpid, $tmpFile]) {
-            pcntl_waitpid($cpid, $status);
-            $this->mergeCounts($counts, $tmpFile);
+        $pending = $children;
+        while (!empty($pending)) {
+            $anyDone = false;
+
+            foreach ($pending as $key => [$cpid, $tmpFile]) {
+                $ret = pcntl_waitpid($cpid, $status, WNOHANG);
+                if ($ret > 0) {
+                    $this->mergeCounts($counts, $tmpFile);
+                    unset($pending[$key]);
+                    $anyDone = true;
+                    break;
+                }
+            }
+
+            if (!$anyDone && !empty($pending)) {
+                reset($pending);
+                $key              = key($pending);
+                [$cpid, $tmpFile] = $pending[$key];
+                pcntl_waitpid($cpid, $status);
+                $this->mergeCounts($counts, $tmpFile);
+                unset($pending[$key]);
+            }
         }
 
         $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
@@ -195,35 +214,15 @@ final class Parser
         return $counts;
     }
 
-    private function writeCounts(string $tmpFile, array $counts): void
-    {
-        $fh        = fopen($tmpFile, 'wb');
-        $chunkSize = 65536;
-
-        for ($i = 0, $total = count($counts); $i < $total; $i += $chunkSize) {
-            fwrite($fh, pack('V*', ...array_slice($counts, $i, $chunkSize)));
-        }
-
-        fclose($fh);
-    }
-
     private function mergeCounts(array &$counts, string $tmpFile): void
     {
-        $fh         = fopen($tmpFile, 'rb');
-        $chunkBytes = 65536 * 4;
-        $j          = 0;
-
-        while (!feof($fh)) {
-            $raw = fread($fh, $chunkBytes);
-            if ($raw === '' || $raw === false) break;
-
-            foreach (unpack('V*', $raw) as $v) {
-                $counts[$j++] += $v;
-            }
-        }
-
-        fclose($fh);
+        $wCounts = unpack('V*', file_get_contents($tmpFile));
         unlink($tmpFile);
+
+        $n = count($counts);
+        for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
+            $counts[$j] += $wCounts[$k];
+        }
     }
 
     private function writeJson(
