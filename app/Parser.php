@@ -288,8 +288,8 @@ final class Parser
         for ($p = 0; $p < $pathCount; $p++) {
             if ($buckets[$p] === '') continue;
             $offset = $p * $dateCount;
-            foreach (unpack('v*', $buckets[$p]) as $did) {
-                $counts[$offset + $did]++;
+            foreach (array_count_values(unpack('v*', $buckets[$p])) as $did => $cnt) {
+                $counts[$offset + $did] += $cnt;
             }
         }
 
