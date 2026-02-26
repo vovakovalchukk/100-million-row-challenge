@@ -254,31 +254,41 @@ final class Parser
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, 1024 * 1024);
 
-        fwrite($out, '{');
+        $pathCount    = count($paths);
+        $datePrefixes = [];
+        $escapedPaths = [];
 
-        $firstPath = true;
-        $pathCount = count($paths);
+        for ($d = 0; $d < $dateCount; $d++) {
+            $datePrefixes[$d] = '        "20' . $dates[$d] . '": ';
+        }
 
         for ($p = 0; $p < $pathCount; $p++) {
-            $base      = $p * $dateCount;
-            $dateParts = [];
+            $escapedPaths[$p] = "\"\\/blog\\/" . str_replace('/', '\\/', $paths[$p]) . '"';
+        }
+
+        fwrite($out, '{');
+        $firstPath = true;
+
+        for ($p = 0; $p < $pathCount; $p++) {
+            $base        = $p * $dateCount;
+            $dateEntries = [];
 
             for ($d = 0; $d < $dateCount; $d++) {
                 $count = $counts[$base + $d];
                 if ($count !== 0) {
-                    $dateParts[] = '        "20' . $dates[$d] . '": ' . $count;
+                    $dateEntries[] = $datePrefixes[$d] . $count;
                 }
             }
 
-            if (empty($dateParts)) continue;
+            if (empty($dateEntries)) continue;
 
             $sep       = $firstPath ? '' : ',';
             $firstPath = false;
 
             fwrite($out,
                 $sep .
-                "\n    \"\\/blog\\/" . str_replace('/', '\\/', $paths[$p]) . "\": {\n" .
-                implode(",\n", $dateParts) .
+                "\n    " . $escapedPaths[$p] . ": {\n" .
+                implode(",\n", $dateEntries) .
                 "\n    }"
             );
         }
