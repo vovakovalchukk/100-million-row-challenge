@@ -6,6 +6,48 @@ namespace App;
 
 use App\Commands\Visit;
 
+use function array_count_values;
+use function array_fill;
+use function chr;
+use function count;
+use function fclose;
+use function fgets;
+use function file_get_contents;
+use function file_put_contents;
+use function filesize;
+use function fopen;
+use function fread;
+use function fseek;
+use function ftell;
+use function fwrite;
+use function gc_disable;
+use function getmypid;
+use function implode;
+use function ini_set;
+use function key;
+use function max;
+use function min;
+use function pack;
+use function pcntl_fork;
+use function pcntl_waitpid;
+use function reset;
+use function shell_exec;
+use function str_replace;
+use function stream_set_read_buffer;
+use function stream_set_write_buffer;
+use function strlen;
+use function strpos;
+use function strrpos;
+use function substr;
+use function sys_get_temp_dir;
+use function trim;
+use function unlink;
+use function unpack;
+
+use const PHP_INT_MAX;
+use const SEEK_CUR;
+use const WNOHANG;
+
 final class Parser
 {
     private const int BUFFER_SIZE   = 8 * 1024 * 1024;
