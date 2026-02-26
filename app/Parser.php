@@ -26,15 +26,13 @@ final class Parser
             $numWorkers = max(2, (int)trim(shell_exec('nproc 2>/dev/null') ?: '2'));
         }
 
-        $monthDayOffset = [];
-        $dates          = [];
-        $dateCount      = 0;
+        $dateIds   = [];
+        $dates     = [];
+        $dateCount = 0;
 
         for ($y = 20; $y <= 27; $y++) {
-            $yi   = $y - 20;
             $yStr = (string)$y;
             for ($m = 1; $m <= 12; $m++) {
-                $mi   = $m - 1;
                 $maxD = match ($m) {
                     2           => (($y + 2000) % 4 === 0) ? 29 : 28,
                     4, 6, 9, 11 => 30,
@@ -42,19 +40,18 @@ final class Parser
                 };
                 $mStr  = ($m < 10 ? '0' : '') . $m;
                 $ymStr = $yStr . '-' . $mStr . '-';
-
-                $monthDayOffset[$yi][$mi] = $dateCount;
-
                 for ($d = 1; $d <= $maxD; $d++) {
-                    $dates[$dateCount++] = $ymStr . (($d < 10 ? '0' : '') . $d);
+                    $key               = $ymStr . (($d < 10 ? '0' : '') . $d);
+                    $dateIds[$key]     = $dateCount;
+                    $dates[$dateCount] = $key;
+                    $dateCount++;
                 }
             }
         }
 
-        // 730 × ~40 bytes = ~29KB
-        $dateBytes = [];
-        for ($d = 0; $d < $dateCount; $d++) {
-            $dateBytes[$d] = chr($d & 0xFF) . chr($d >> 8);
+        $dateIdBytes = [];
+        foreach ($dateIds as $date => $id) {
+            $dateIdBytes[$date] = chr($id & 0xFF) . chr($id >> 8);
         }
 
         $handle = fopen($inputPath, 'rb');
@@ -66,6 +63,7 @@ final class Parser
         $paths      = [];
         $pathCount  = 0;
         $minSlugLen = PHP_INT_MAX;
+        $maxLineLen = 0;
         $pos        = 0;
         $lastNl     = strrpos($raw, "\n") ?: 0;
 
@@ -74,13 +72,11 @@ final class Parser
             if ($nl === false) break;
 
             $lineLen = $nl - $pos;
-            $slug    = substr($raw, $pos + self::PREFIX_LEN,
-                $lineLen - self::PREFIX_LEN - self::SUFFIX_LEN);
-            $slugLen = strlen($slug);
+            $slugLen = $lineLen - self::PREFIX_LEN - self::SUFFIX_LEN;
+            $slug    = substr($raw, $pos + self::PREFIX_LEN, $slugLen);
 
-            if ($slugLen < $minSlugLen) {
-                $minSlugLen = $slugLen;
-            }
+            if ($slugLen < $minSlugLen) $minSlugLen = $slugLen;
+            if ($lineLen > $maxLineLen) $maxLineLen = $lineLen;
 
             if (!isset($pathIds[$slug])) {
                 $pathIds[$slug]    = $pathCount;
@@ -95,10 +91,10 @@ final class Parser
         foreach (Visit::all() as $visit) {
             $slug    = substr($visit->uri, self::PREFIX_LEN);
             $slugLen = strlen($slug);
+            $lineLen = self::PREFIX_LEN + $slugLen + self::SUFFIX_LEN;
 
-            if ($slugLen < $minSlugLen) {
-                $minSlugLen = $slugLen;
-            }
+            if ($slugLen < $minSlugLen) $minSlugLen = $slugLen;
+            if ($lineLen > $maxLineLen) $maxLineLen = $lineLen;
 
             if (!isset($pathIds[$slug])) {
                 $pathIds[$slug]    = $pathCount;
@@ -107,7 +103,11 @@ final class Parser
             }
         }
 
-        $strposHint = self::PREFIX_LEN + $minSlugLen + self::SUFFIX_LEN;
+        if ($maxLineLen === 0) $maxLineLen = 120;
+        if ($minSlugLen === PHP_INT_MAX) $minSlugLen = 5;
+
+        $strposHint     = self::PREFIX_LEN + $minSlugLen + self::SUFFIX_LEN;
+        $safeZoneOffset = $maxLineLen * 5 + $strposHint;
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
@@ -134,8 +134,8 @@ final class Parser
 
                 $wCounts = $this->processChunk(
                     $inputPath, $splitPoints[$w], $splitPoints[$w + 1],
-                    $pathIds, $monthDayOffset, $dateBytes,
-                    $pathCount, $dateCount, $strposHint,
+                    $pathIds, $dateIdBytes, $pathCount, $dateCount,
+                    $strposHint, $safeZoneOffset,
                 );
 
                 file_put_contents($tmpFile, pack('V*', ...$wCounts));
@@ -149,8 +149,8 @@ final class Parser
             $inputPath,
             $splitPoints[$numWorkers - 1],
             $splitPoints[$numWorkers],
-            $pathIds, $monthDayOffset, $dateBytes,
-            $pathCount, $dateCount, $strposHint,
+            $pathIds, $dateIdBytes, $pathCount, $dateCount,
+            $strposHint, $safeZoneOffset,
         );
 
         $pending = $children;
@@ -195,11 +195,11 @@ final class Parser
         int    $start,
         int    $end,
         array  $pathIds,
-        array  $monthDayOffset,
-        array  $dateBytes,
+        array  $dateIdBytes,
         int    $pathCount,
         int    $dateCount,
         int    $strposHint,
+        int    $safeZoneOffset,
     ): array {
         $buckets   = array_fill(0, $pathCount, '');
         $handle    = fopen($inputPath, 'rb');
@@ -239,27 +239,43 @@ final class Parser
                 $line    = $leftover . substr($chunk, 0, $nl);
                 $lineLen = strlen($line);
                 $leftover = '';
-
                 $buckets[$pathIds[substr($line, $prefixLen, $lineLen - $prefixLen - $suffixLen)]]
-                    .= $dateBytes[
-                $monthDayOffset[ord($line[$lineLen - 22]) - 48]
-                [(ord($line[$lineLen - 20]) - 48) * 10 + ord($line[$lineLen - 19]) - 49]
-                + (ord($line[$lineLen - 17]) - 48) * 10 + ord($line[$lineLen - 16]) - 49
-                ];
+                    .= $dateIdBytes[substr($line, $lineLen - 25, 8)];
             }
 
-            $pos = 0;
+            $pos      = 0;
+            $safeZone = $lastNl - $safeZoneOffset;
+
+            while ($pos < $safeZone) {
+                $nl = strpos($chunk, "\n", $pos + $strposHint);
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $pos = $nl + 1;
+
+                $nl = strpos($chunk, "\n", $pos + $strposHint);
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $pos = $nl + 1;
+
+                $nl = strpos($chunk, "\n", $pos + $strposHint);
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $pos = $nl + 1;
+
+                $nl = strpos($chunk, "\n", $pos + $strposHint);
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $pos = $nl + 1;
+
+                $nl = strpos($chunk, "\n", $pos + $strposHint);
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $pos = $nl + 1;
+
+                $nl = strpos($chunk, "\n", $pos + $strposHint);
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
+                $pos = $nl + 1;
+            }
 
             while ($pos < $lastNl) {
                 $nl = strpos($chunk, "\n", $pos + $strposHint);
-
-                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]]
-                    .= $dateBytes[
-                $monthDayOffset[ord($chunk[$nl - 22]) - 48]
-                [(ord($chunk[$nl - 20]) - 48) * 10 + ord($chunk[$nl - 19]) - 49]
-                + (ord($chunk[$nl - 17]) - 48) * 10 + ord($chunk[$nl - 16]) - 49
-                ];
-
+                if ($nl === false) break;
+                $buckets[$pathIds[substr($chunk, $pos + $prefixLen, $nl - $pos - $prefixLen - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
                 $pos = $nl + 1;
             }
 
