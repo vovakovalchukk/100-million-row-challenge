@@ -6,72 +6,76 @@ namespace App;
 
 final class Parser
 {
-    private const int WORKER_COUNT = 2;
+    private const int WORKERS      = 6;
+    private const int BUFFER_SIZE  = 8 * 1024 * 1024;
     private const int WRITE_BUFFER = 8 * 1024 * 1024;
 
     private const int DOMAIN_LEN = 19;
     private const int TS_LEN     = 25;
     private const int DATE_LEN   = 10;
+    private const int MIN_LINE   = 45;
 
     private bool $hasIgbinary;
-    private int  $readChunk;
 
     public function __construct()
     {
         $this->hasIgbinary = function_exists('igbinary_serialize');
-
-        $this->readChunk = PHP_OS_FAMILY === 'Linux'
-            ? 32 * 1024 * 1024
-            :  4 * 1024 * 1024;
     }
 
     public function parse(string $inputPath, string $outputPath): void
     {
         ini_set('memory_limit', '-1');
 
-        $chunks  = $this->getChunks($inputPath);
-        $tmpDir  = is_dir('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
-        $pid     = getmypid();
+        $fileSize    = filesize($inputPath);
+        $workerCount = self::WORKERS;
 
-        $tempFiles = [];
-        for ($i = 0; $i < self::WORKER_COUNT; $i++) {
-            $tempFiles[$i] = "{$tmpDir}/php100m_{$pid}_{$i}.bin";
+        $splitPoints = [0];
+        $handle = fopen($inputPath, 'rb');
+        for ($i = 1; $i < $workerCount; $i++) {
+            $offset = (int)($fileSize * $i / $workerCount);
+            fseek($handle, $offset);
+            fgets($handle);
+            $splitPoints[] = ftell($handle);
         }
+        fclose($handle);
+        $splitPoints[] = $fileSize;
 
-        $pids = [];
-        for ($i = 0; $i < self::WORKER_COUNT; $i++) {
-            $fork = pcntl_fork();
+        $children = [];
+        for ($i = 1; $i < $workerCount; $i++) {
+            $pipes = stream_socket_pair(
+                STREAM_PF_UNIX,
+                STREAM_SOCK_STREAM,
+                STREAM_IPPROTO_IP,
+            );
 
-            if ($fork === -1) {
-                throw new \RuntimeException('pcntl_fork failed');
-            }
+            $pid = pcntl_fork();
 
-            if ($fork === 0) {
+            if ($pid === 0) {
                 ini_set('memory_limit', '-1');
-                $this->runWorker($inputPath, $chunks[$i][0], $chunks[$i][1], $tempFiles[$i]);
+                fclose($pipes[0]);
+
+                $data   = $this->processChunk($inputPath, $splitPoints[$i], $splitPoints[$i + 1]);
+                $packed = $this->encode($data);
+                unset($data);
+
+                fwrite($pipes[1], $packed);
+                fclose($pipes[1]);
                 exit(0);
             }
 
-            $pids[] = $fork;
+            fclose($pipes[1]);
+            $children[] = ['pid' => $pid, 'pipe' => $pipes[0]];
         }
 
-        foreach ($pids as $fork) {
-            pcntl_waitpid($fork, $status);
+        $result = $this->processChunk($inputPath, $splitPoints[0], $splitPoints[1]);
 
-            if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
-                foreach ($tempFiles as $f) {
-                    if (file_exists($f)) {
-                        unlink($f);
-                    }
-                }
-                throw new \RuntimeException('Worker process failed');
-            }
-        }
+        foreach ($children as $child) {
+            $packed = stream_get_contents($child['pipe']);
+            fclose($child['pipe']);
+            pcntl_waitpid($child['pid'], $status);
 
-        $result = [];
-        foreach ($tempFiles as $tempFile) {
-            $partial = $this->decode(file_get_contents($tempFile));
-            unlink($tempFile);
+            $partial = $this->decode($packed);
+            unset($packed);
 
             foreach ($partial as $path => $dates) {
                 if (isset($result[$path])) {
@@ -86,7 +90,6 @@ final class Parser
                     $result[$path] = $dates;
                 }
             }
-
             unset($partial);
         }
 
@@ -98,72 +101,55 @@ final class Parser
         $this->writeJson($result, $outputPath);
     }
 
-    private function runWorker(
-        string $inputPath,
-        int    $start,
-        int    $end,
-        string $tempFile,
-    ): void {
+    private function processChunk(string $inputPath, int $start, int $end): array
+    {
         $data      = [];
         $handle    = fopen($inputPath, 'rb');
         $remaining = $end - $start;
 
+        stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
 
-        $readChunk  = $this->readChunk;
-        $domainLen  = self::DOMAIN_LEN;
-        $tsLen      = self::TS_LEN;
-        $dateLen    = self::DATE_LEN;
-        $minLen     = $domainLen + $tsLen;
+        $bufSize   = self::BUFFER_SIZE;
+        $domainLen = self::DOMAIN_LEN;
+        $tsLen     = self::TS_LEN;
+        $dateLen   = self::DATE_LEN;
+        $minLine   = self::MIN_LINE;
 
         $leftover = '';
 
         while ($remaining > 0) {
-            $raw = fread($handle, min($readChunk, $remaining));
-
-            if ($raw === false || $raw === '') {
-                break;
-            }
+            $raw = fread($handle, min($bufSize, $remaining));
+            if ($raw === false || $raw === '') break;
 
             $remaining -= strlen($raw);
-            $pos        = 0;
             $rawLen     = strlen($raw);
+            $pos        = 0;
 
             if ($leftover !== '') {
                 $nl = strpos($raw, "\n");
-
-                if ($nl === false) {
-                    $leftover .= $raw;
-                    continue;
-                }
+                if ($nl === false) { $leftover .= $raw; continue; }
 
                 $line    = $leftover . substr($raw, 0, $nl);
-                $lineEnd = strlen($line);
+                $lineLen = strlen($line);
                 $leftover = '';
 
-                if ($lineEnd > $minLen) {
-                    $date = substr($line, $lineEnd - $tsLen, $dateLen);
-                    $path = substr($line, $domainLen, $lineEnd - $domainLen - $tsLen - 1);
-
+                if ($lineLen > $minLine) {
+                    $date = substr($line, $lineLen - $tsLen, $dateLen);
+                    $path = substr($line, $domainLen, $lineLen - $domainLen - $tsLen - 1);
                     $cell = &$data[$path][$date];
                     $cell !== null ? $cell++ : ($cell = 1);
                     unset($cell);
                 }
-
                 $pos = $nl + 1;
             }
 
             while ($pos < $rawLen) {
                 $nl = strpos($raw, "\n", $pos);
+                if ($nl === false) { $leftover = substr($raw, $pos); break; }
 
-                if ($nl === false) {
-                    $leftover = substr($raw, $pos);
-                    break;
-                }
-
-                if ($nl - $pos > $minLen) {
+                if ($nl - $pos > $minLine) {
                     $date = substr($raw, $nl - $tsLen, $dateLen);
-
                     $path = substr($raw, $pos + $domainLen, $nl - $pos - $domainLen - $tsLen - 1);
 
                     $cell = &$data[$path][$date];
@@ -176,12 +162,10 @@ final class Parser
         }
 
         if ($leftover !== '') {
-            $lineEnd = strlen($leftover);
-
-            if ($lineEnd > $minLen) {
-                $date = substr($leftover, $lineEnd - $tsLen, $dateLen);
-                $path = substr($leftover, $domainLen, $lineEnd - $domainLen - $tsLen - 1);
-
+            $lineLen = strlen($leftover);
+            if ($lineLen > $minLine) {
+                $date = substr($leftover, $lineLen - $tsLen, $dateLen);
+                $path = substr($leftover, $domainLen, $lineLen - $domainLen - $tsLen - 1);
                 $cell = &$data[$path][$date];
                 $cell !== null ? $cell++ : ($cell = 1);
                 unset($cell);
@@ -189,7 +173,7 @@ final class Parser
         }
 
         fclose($handle);
-        file_put_contents($tempFile, $this->encode($data));
+        return $data;
     }
 
     private function writeJson(array $result, string $outputPath): void
@@ -230,31 +214,6 @@ final class Parser
 
         fwrite($out, $buf . '}');
         fclose($out);
-    }
-
-    private function getChunks(string $file): array
-    {
-        $size      = filesize($file);
-        $chunkSize = (int) ceil($size / self::WORKER_COUNT);
-        $handle    = fopen($file, 'rb');
-        $chunks    = [];
-        $start     = 0;
-
-        while ($start < $size) {
-            $end = min($size, $start + $chunkSize);
-
-            if ($end < $size) {
-                fseek($handle, $end);
-                fgets($handle);
-                $end = ftell($handle);
-            }
-
-            $chunks[] = [$start, $end];
-            $start    = $end;
-        }
-
-        fclose($handle);
-        return $chunks;
     }
 
     private function encode(array $data): string
