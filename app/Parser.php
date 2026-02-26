@@ -23,14 +23,16 @@ use function fwrite;
 use function gc_disable;
 use function getmypid;
 use function ini_set;
-use function key;
 use function max;
 use function min;
 use function pack;
 use function pcntl_fork;
-use function pcntl_waitpid;
-use function reset;
+use function pcntl_wait;
 use function shell_exec;
+use function shmop_delete;
+use function shmop_open;
+use function shmop_read;
+use function shmop_write;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
@@ -44,12 +46,12 @@ use function unlink;
 use function unpack;
 
 use const PHP_INT_MAX;
+use const PHP_OS_FAMILY;
 use const SEEK_CUR;
-use const WNOHANG;
 
 final class Parser
 {
-    private const int BUFFER_SIZE   = 1 * 1024 * 1024;
+    private const int BUFFER_SIZE   = 2 * 1024 * 1024;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
     private const int SUFFIX_LEN    = 26;
@@ -97,14 +99,13 @@ final class Parser
         $raw = fread($handle, min(self::DISCOVER_SIZE, $fileSize));
         fclose($handle);
 
-        $pathIds    = [];
-        $paths      = [];
-        $pathCount  = 0;
-        $minSlugLen = PHP_INT_MAX;
-        $maxLineLen = 0;
-        $pos        = 0;
-        $lastNl     = strrpos($raw, "\n") ?: 0;
-
+        $pathIds      = [];
+        $paths        = [];
+        $pathCount    = 0;
+        $minSlugLen   = PHP_INT_MAX;
+        $maxLineLen   = 0;
+        $pos          = 0;
+        $lastNl       = strrpos($raw, "\n") ?: 0;
         $discoverHint = self::PREFIX_LEN + 1 + self::SUFFIX_LEN;
 
         while ($pos < $lastNl) {
@@ -147,7 +148,7 @@ final class Parser
         if ($minSlugLen === PHP_INT_MAX) $minSlugLen = 5;
 
         $strposHint     = self::PREFIX_LEN + $minSlugLen + self::SUFFIX_LEN;
-        $safeZoneOffset = $maxLineLen * 6;
+        $safeZoneOffset = $maxLineLen * 4;
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
@@ -159,13 +160,30 @@ final class Parser
         fclose($bh);
         $splitPoints[] = $fileSize;
 
-        $tmpDir   = sys_get_temp_dir();
-        $myPid    = getmypid();
-        $children = [];
+        $myPid   = getmypid();
+        $shmSize = $pathCount * $dateCount * 4;
+        $tmpDir  = sys_get_temp_dir();
+
+        if (PHP_OS_FAMILY === 'Darwin') {
+            $shmMax   = (int)trim(shell_exec('sysctl -n kern.sysv.shmmax') ?: '0');
+            $shmAll   = (int)trim(shell_exec('sysctl -n kern.sysv.shmall') ?: '0');
+            $maxTotal = min($shmMax, $shmAll * 4096);
+            $canUseShm = ($shmSize > 0)
+                && ($maxTotal > 0)
+                && ($shmSize * ($numWorkers - 1) <= $maxTotal);
+        } else {
+            $canUseShm = true;
+        }
+
+        $childMap = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
+            $shmKey  = $myPid * 100 + $w;
             $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $w;
-            $pid     = pcntl_fork();
+            $shm     = $canUseShm ? shmop_open($shmKey, 'c', 0644, $shmSize) : false;
+            $useShm  = ($shm !== false);
+
+            $pid = pcntl_fork();
             if ($pid === -1) throw new \RuntimeException('pcntl_fork failed');
 
             if ($pid === 0) {
@@ -178,14 +196,26 @@ final class Parser
                     $strposHint, $safeZoneOffset,
                 );
 
-                file_put_contents($tmpFile, pack('V*', ...$wCounts));
+                $packed = pack('V*', ...$wCounts);
+
+                if ($useShm) {
+                    shmop_write($shm, $packed, 0);
+                } else {
+                    file_put_contents($tmpFile, $packed);
+                }
+
                 exit(0);
             }
 
-            $children[] = [$pid, $tmpFile];
+            $childMap[$pid] = [
+                'shm'     => $shm,
+                'shmKey'  => $shmKey,
+                'tmpFile' => $tmpFile,
+                'useShm'  => $useShm,
+            ];
         }
 
-        $counts = $this->processChunk(
+        $counts  = $this->processChunk(
             $inputPath,
             $splitPoints[$numWorkers - 1],
             $splitPoints[$numWorkers],
@@ -193,38 +223,29 @@ final class Parser
             $strposHint, $safeZoneOffset,
         );
 
-        $pending = $children;
         $n       = $pathCount * $dateCount;
+        $pending = count($childMap);
 
-        while (!empty($pending)) {
-            $anyDone = false;
+        while ($pending > 0) {
+            $pid = pcntl_wait($status);
+            if (!isset($childMap[$pid])) continue;
 
-            foreach ($pending as $key => [$cpid, $tmpFile]) {
-                $ret = pcntl_waitpid($cpid, $status, WNOHANG);
-                if ($ret > 0) {
-                    $wCounts = unpack('V*', file_get_contents($tmpFile));
-                    unlink($tmpFile);
-                    for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
-                        $counts[$j] += $wCounts[$k];
-                    }
-                    unset($pending[$key]);
-                    $anyDone = true;
-                    break;
-                }
+            $info    = $childMap[$pid];
+            $j       = 0;
+
+            if ($info['useShm']) {
+                $wCounts = unpack('V*', shmop_read($info['shm'], 0, $shmSize));
+                shmop_delete($info['shm']);
+            } else {
+                $wCounts = unpack('V*', file_get_contents($info['tmpFile']));
+                unlink($info['tmpFile']);
             }
 
-            if (!$anyDone && !empty($pending)) {
-                reset($pending);
-                $key              = key($pending);
-                [$cpid, $tmpFile] = $pending[$key];
-                pcntl_waitpid($cpid, $status);
-                $wCounts = unpack('V*', file_get_contents($tmpFile));
-                unlink($tmpFile);
-                for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
-                    $counts[$j] += $wCounts[$k];
-                }
-                unset($pending[$key]);
+            foreach ($wCounts as $v) {
+                $counts[$j++] += $v;
             }
+
+            $pending--;
         }
 
         $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
@@ -251,8 +272,7 @@ final class Parser
         $bufSize    = self::BUFFER_SIZE;
         $prefixLen  = self::PREFIX_LEN;
         $suffixLen  = self::SUFFIX_LEN;
-
-        $slugHint = $strposHint - $prefixLen;
+        $slugHint   = $strposHint - $prefixLen;
 
         while ($remaining > 0) {
             $toRead = $remaining > $bufSize ? $bufSize : $remaining;
@@ -281,34 +301,26 @@ final class Parser
             while ($slugPos < $safeZoneSlug) {
                 $nl = strpos($chunk, "\n", $slugPos + $slugHint);
                 $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
+                $slugPos = $nl + $suffixLen;
 
                 $nl = strpos($chunk, "\n", $slugPos + $slugHint);
                 $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
+                $slugPos = $nl + $suffixLen;
 
                 $nl = strpos($chunk, "\n", $slugPos + $slugHint);
                 $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
+                $slugPos = $nl + $suffixLen;
 
                 $nl = strpos($chunk, "\n", $slugPos + $slugHint);
                 $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
-
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
-
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
+                $slugPos = $nl + $suffixLen;
             }
 
             while ($slugPos < $lastNl) {
                 $nl = strpos($chunk, "\n", $slugPos + $slugHint);
                 if ($nl === false) break;
                 $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $prefixLen + 1;
+                $slugPos = $nl + $suffixLen;
             }
         }
 
