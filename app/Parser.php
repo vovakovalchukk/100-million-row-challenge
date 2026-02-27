@@ -6,7 +6,6 @@ namespace App;
 
 use App\Commands\Visit;
 
-use function array_chunk;
 use function array_count_values;
 use function array_fill;
 use function chr;
@@ -14,6 +13,7 @@ use function count;
 use function fclose;
 use function fgets;
 use function file_get_contents;
+use function file_put_contents;
 use function filesize;
 use function fopen;
 use function fread;
@@ -44,7 +44,7 @@ use const SEEK_CUR;
 
 final class Parser
 {
-    private const int BUFFER_SIZE   = 2 * 1024 * 1024;
+    private const int BUFFER_SIZE   = 163_840;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
     private const int SUFFIX_LEN    = 26;
@@ -171,11 +171,7 @@ final class Parser
                     $strposHint, $safeZoneOffset,
                 );
 
-                $fh = fopen($tmpFile, 'wb');
-                foreach (array_chunk($wCounts, 8192) as $batch) {
-                    fwrite($fh, pack('V*', ...$batch));
-                }
-                fclose($fh);
+                file_put_contents($tmpFile, pack('V*', ...$wCounts));
                 exit(0);
             }
 
