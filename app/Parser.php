@@ -25,6 +25,7 @@ use function getmypid;
 use function ini_set;
 use function max;
 use function min;
+use function ord;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
@@ -171,7 +172,11 @@ final class Parser
                     $strposHint, $safeZoneOffset,
                 );
 
-                file_put_contents($tmpFile, pack('V*', ...$wCounts));
+                $use16Bit = max($wCounts) <= 65_535;
+                file_put_contents(
+                    $tmpFile,
+                    ($use16Bit ? "\x00" : "\x01") . pack($use16Bit ? 'v*' : 'V*', ...$wCounts)
+                );
                 exit(0);
             }
 
@@ -194,11 +199,15 @@ final class Parser
             if (!isset($childMap[$pid])) continue;
 
             $tmpFile = $childMap[$pid];
+            $raw     = file_get_contents($tmpFile);
+            unlink($tmpFile);
+
+            $format  = ord($raw[0]) === 0 ? 'v*' : 'V*';
+            $wCounts = unpack($format, substr($raw, 1));
             $j = 0;
-            foreach (unpack('V*', file_get_contents($tmpFile)) as $v) {
+            foreach ($wCounts as $v) {
                 $counts[$j++] += $v;
             }
-            unlink($tmpFile);
             $pending--;
         }
 
