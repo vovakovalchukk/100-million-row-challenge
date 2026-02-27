@@ -1,7 +1,5 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App;
 
 use App\Commands\Visit;
@@ -23,7 +21,6 @@ use function fwrite;
 use function gc_disable;
 use function getmypid;
 use function implode;
-use function ini_set;
 use function min;
 use function pack;
 use function pcntl_fork;
@@ -49,10 +46,9 @@ final class Parser
     private const int PREFIX_LEN    = 25;
     private const int WORKERS       = 10;
 
-    public function parse(string $inputPath, string $outputPath): void
+    public function parse($inputPath, $outputPath)
     {
         gc_disable();
-        ini_set('memory_limit', '-1');
 
         $fileSize   = filesize($inputPath);
         $numWorkers = self::WORKERS;
@@ -61,8 +57,7 @@ final class Parser
         $dates     = [];
         $dateCount = 0;
 
-        for ($y = 20; $y <= 26; $y++) {
-            $yStr = (string)$y;
+        for ($y = 21; $y <= 26; $y++) {
             for ($m = 1; $m <= 12; $m++) {
                 $maxD = match ($m) {
                     2           => (($y + 2000) % 4 === 0) ? 29 : 28,
@@ -70,7 +65,7 @@ final class Parser
                     default     => 31,
                 };
                 $mStr  = ($m < 10 ? '0' : '') . $m;
-                $ymStr = $yStr . '-' . $mStr . '-';
+                $ymStr = $y . '-' . $mStr . '-';
                 for ($d = 1; $d <= $maxD; $d++) {
                     $key               = $ymStr . (($d < 10 ? '0' : '') . $d);
                     $dateIds[$key]     = $dateCount;
@@ -141,9 +136,6 @@ final class Parser
             if ($pid === -1) throw new \RuntimeException('pcntl_fork failed');
 
             if ($pid === 0) {
-                gc_disable();
-                ini_set('memory_limit', '-1');
-
                 $wCounts = $this->processChunk(
                     $inputPath, $splitPoints[$w], $splitPoints[$w + 1],
                     $pathIds, $dateIdBytes, $pathCount, $dateCount,
@@ -156,7 +148,7 @@ final class Parser
             $childMap[$pid] = $tmpFile;
         }
 
-        $counts  = $this->processChunk(
+        $counts = $this->processChunk(
             $inputPath,
             $splitPoints[$numWorkers - 1],
             $splitPoints[$numWorkers],
@@ -185,15 +177,8 @@ final class Parser
         $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private function processChunk(
-        string $inputPath,
-        int    $start,
-        int    $end,
-        array  $pathIds,
-        array  $dateIdBytes,
-        int    $pathCount,
-        int    $dateCount,
-    ): array {
+    private function processChunk($inputPath, $start, $end, $pathIds, $dateIdBytes, $pathCount, $dateCount)
+    {
         $buckets   = array_fill(0, $pathCount, '');
         $handle    = fopen($inputPath, 'rb');
         $remaining = $end - $start;
@@ -275,13 +260,8 @@ final class Parser
         return $counts;
     }
 
-    private function writeJson(
-        string $outputPath,
-        array  $counts,
-        array  $paths,
-        array  $dates,
-        int    $dateCount,
-    ): void {
+    private function writeJson($outputPath, $counts, $paths, $dates, $dateCount)
+    {
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, 1024 * 1024);
 
