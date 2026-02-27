@@ -23,9 +23,7 @@ use function fwrite;
 use function gc_disable;
 use function getmypid;
 use function ini_set;
-use function max;
 use function min;
-use function ord;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
@@ -172,11 +170,7 @@ final class Parser
                     $strposHint, $safeZoneOffset,
                 );
 
-                $use16Bit = max($wCounts) <= 65_535;
-                file_put_contents(
-                    $tmpFile,
-                    ($use16Bit ? "\x00" : "\x01") . pack($use16Bit ? 'v*' : 'V*', ...$wCounts)
-                );
+                file_put_contents($tmpFile, pack('v*', ...$wCounts));
                 exit(0);
             }
 
@@ -199,11 +193,8 @@ final class Parser
             if (!isset($childMap[$pid])) continue;
 
             $tmpFile = $childMap[$pid];
-            $raw     = file_get_contents($tmpFile);
+            $wCounts = unpack('v*', file_get_contents($tmpFile));
             unlink($tmpFile);
-
-            $format  = ord($raw[0]) === 0 ? 'v*' : 'V*';
-            $wCounts = unpack($format, substr($raw, 1));
             $j = 0;
             foreach ($wCounts as $v) {
                 $counts[$j++] += $v;
