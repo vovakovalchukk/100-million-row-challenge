@@ -6,6 +6,7 @@ namespace App;
 
 use App\Commands\Visit;
 
+use function array_chunk;
 use function array_count_values;
 use function array_fill;
 use function chr;
@@ -13,7 +14,6 @@ use function count;
 use function fclose;
 use function fgets;
 use function file_get_contents;
-use function file_put_contents;
 use function filesize;
 use function fopen;
 use function fread;
@@ -28,11 +28,6 @@ use function min;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
-use function shell_exec;
-use function shmop_delete;
-use function shmop_open;
-use function shmop_read;
-use function shmop_write;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
@@ -41,12 +36,10 @@ use function strpos;
 use function strrpos;
 use function substr;
 use function sys_get_temp_dir;
-use function trim;
 use function unlink;
 use function unpack;
 
 use const PHP_INT_MAX;
-use const PHP_OS_FAMILY;
 use const SEEK_CUR;
 
 final class Parser
@@ -55,16 +48,15 @@ final class Parser
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
     private const int SUFFIX_LEN    = 26;
+    private const int WORKERS       = 12;
 
     public function parse(string $inputPath, string $outputPath): void
     {
         gc_disable();
         ini_set('memory_limit', '-1');
 
-        $fileSize = filesize($inputPath);
-
-        $numCpu     = max(1, (int)trim(shell_exec('sysctl -n hw.ncpu') ?: '8'));
-        $numWorkers = max(8, min(16, (int)($numCpu * 1.5)));
+        $fileSize   = filesize($inputPath);
+        $numWorkers = self::WORKERS;
 
         $dateIds   = [];
         $dates     = [];
@@ -160,30 +152,13 @@ final class Parser
         fclose($bh);
         $splitPoints[] = $fileSize;
 
-        $myPid   = getmypid();
-        $shmSize = $pathCount * $dateCount * 4;
-        $tmpDir  = sys_get_temp_dir();
-
-        if (PHP_OS_FAMILY === 'Darwin') {
-            $shmMax   = (int)trim(shell_exec('sysctl -n kern.sysv.shmmax') ?: '0');
-            $shmAll   = (int)trim(shell_exec('sysctl -n kern.sysv.shmall') ?: '0');
-            $maxTotal = min($shmMax, $shmAll * 4096);
-            $canUseShm = ($shmSize > 0)
-                && ($maxTotal > 0)
-                && ($shmSize * ($numWorkers - 1) <= $maxTotal);
-        } else {
-            $canUseShm = true;
-        }
-
+        $tmpDir   = sys_get_temp_dir();
+        $myPid    = getmypid();
         $childMap = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
-            $shmKey  = $myPid * 100 + $w;
             $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $w;
-            $shm     = $canUseShm ? shmop_open($shmKey, 'c', 0644, $shmSize) : false;
-            $useShm  = ($shm !== false);
-
-            $pid = pcntl_fork();
+            $pid     = pcntl_fork();
             if ($pid === -1) throw new \RuntimeException('pcntl_fork failed');
 
             if ($pid === 0) {
@@ -196,23 +171,15 @@ final class Parser
                     $strposHint, $safeZoneOffset,
                 );
 
-                $packed = pack('V*', ...$wCounts);
-
-                if ($useShm) {
-                    shmop_write($shm, $packed, 0);
-                } else {
-                    file_put_contents($tmpFile, $packed);
+                $fh = fopen($tmpFile, 'wb');
+                foreach (array_chunk($wCounts, 8192) as $batch) {
+                    fwrite($fh, pack('V*', ...$batch));
                 }
-
+                fclose($fh);
                 exit(0);
             }
 
-            $childMap[$pid] = [
-                'shm'     => $shm,
-                'shmKey'  => $shmKey,
-                'tmpFile' => $tmpFile,
-                'useShm'  => $useShm,
-            ];
+            $childMap[$pid] = $tmpFile;
         }
 
         $counts  = $this->processChunk(
@@ -230,21 +197,12 @@ final class Parser
             $pid = pcntl_wait($status);
             if (!isset($childMap[$pid])) continue;
 
-            $info    = $childMap[$pid];
-            $j       = 0;
-
-            if ($info['useShm']) {
-                $wCounts = unpack('V*', shmop_read($info['shm'], 0, $shmSize));
-                shmop_delete($info['shm']);
-            } else {
-                $wCounts = unpack('V*', file_get_contents($info['tmpFile']));
-                unlink($info['tmpFile']);
-            }
-
-            foreach ($wCounts as $v) {
+            $tmpFile = $childMap[$pid];
+            $j = 0;
+            foreach (unpack('V*', file_get_contents($tmpFile)) as $v) {
                 $counts[$j++] += $v;
             }
-
+            unlink($tmpFile);
             $pending--;
         }
 
