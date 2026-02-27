@@ -47,7 +47,7 @@ final class Parser
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
     private const int SUFFIX_LEN    = 26;
-    private const int WORKERS       = 12;
+    private const int WORKERS       = 10;
 
     public function parse(string $inputPath, string $outputPath): void
     {
