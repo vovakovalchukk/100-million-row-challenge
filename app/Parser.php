@@ -38,7 +38,6 @@ use function sys_get_temp_dir;
 use function unlink;
 use function unpack;
 
-use const PHP_INT_MAX;
 use const SEEK_CUR;
 
 final class Parser
@@ -90,25 +89,17 @@ final class Parser
         $raw = fread($handle, min(self::DISCOVER_SIZE, $fileSize));
         fclose($handle);
 
-        $pathIds      = [];
-        $paths        = [];
-        $pathCount    = 0;
-        $minSlugLen   = PHP_INT_MAX;
-        $maxLineLen   = 0;
-        $pos          = 0;
-        $lastNl       = strrpos($raw, "\n") ?: 0;
-        $discoverHint = self::PREFIX_LEN + 1 + self::SUFFIX_LEN;
+        $pathIds   = [];
+        $paths     = [];
+        $pathCount = 0;
+        $pos       = 0;
+        $lastNl    = strrpos($raw, "\n") ?: 0;
 
         while ($pos < $lastNl) {
-            $nl = strpos($raw, "\n", $pos + $discoverHint);
+            $nl = strpos($raw, "\n", $pos + 52);
             if ($nl === false) break;
 
-            $lineLen = $nl - $pos;
-            $slugLen = $lineLen - self::PREFIX_LEN - self::SUFFIX_LEN;
-            $slug    = substr($raw, $pos + self::PREFIX_LEN, $slugLen);
-
-            if ($slugLen < $minSlugLen) $minSlugLen = $slugLen;
-            if ($lineLen > $maxLineLen) $maxLineLen = $lineLen;
+            $slug = substr($raw, $pos + self::PREFIX_LEN, $nl - $pos - 51);
 
             if (!isset($pathIds[$slug])) {
                 $pathIds[$slug]    = $pathCount;
@@ -121,25 +112,13 @@ final class Parser
         unset($raw);
 
         foreach (Visit::all() as $visit) {
-            $slug    = substr($visit->uri, self::PREFIX_LEN);
-            $slugLen = strlen($slug);
-            $lineLen = self::PREFIX_LEN + $slugLen + self::SUFFIX_LEN;
-
-            if ($slugLen < $minSlugLen) $minSlugLen = $slugLen;
-            if ($lineLen > $maxLineLen) $maxLineLen = $lineLen;
-
+            $slug = substr($visit->uri, self::PREFIX_LEN);
             if (!isset($pathIds[$slug])) {
                 $pathIds[$slug]    = $pathCount;
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
         }
-
-        if ($maxLineLen === 0) $maxLineLen = 120;
-        if ($minSlugLen === PHP_INT_MAX) $minSlugLen = 5;
-
-        $strposHint     = self::PREFIX_LEN + $minSlugLen + self::SUFFIX_LEN;
-        $safeZoneOffset = $maxLineLen * 4;
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
@@ -167,7 +146,6 @@ final class Parser
                 $wCounts = $this->processChunk(
                     $inputPath, $splitPoints[$w], $splitPoints[$w + 1],
                     $pathIds, $dateIdBytes, $pathCount, $dateCount,
-                    $strposHint, $safeZoneOffset,
                 );
 
                 file_put_contents($tmpFile, pack('v*', ...$wCounts));
@@ -182,7 +160,6 @@ final class Parser
             $splitPoints[$numWorkers - 1],
             $splitPoints[$numWorkers],
             $pathIds, $dateIdBytes, $pathCount, $dateCount,
-            $strposHint, $safeZoneOffset,
         );
 
         $n       = $pathCount * $dateCount;
@@ -213,8 +190,6 @@ final class Parser
         array  $dateIdBytes,
         int    $pathCount,
         int    $dateCount,
-        int    $strposHint,
-        int    $safeZoneOffset,
     ): array {
         $buckets   = array_fill(0, $pathCount, '');
         $handle    = fopen($inputPath, 'rb');
@@ -223,10 +198,8 @@ final class Parser
         stream_set_read_buffer($handle, 0);
         fseek($handle, $start);
 
-        $bufSize    = self::BUFFER_SIZE;
-        $prefixLen  = self::PREFIX_LEN;
-        $suffixLen  = self::SUFFIX_LEN;
-        $slugHint   = $strposHint - $prefixLen;
+        $bufSize   = self::BUFFER_SIZE;
+        $prefixLen = self::PREFIX_LEN;
 
         while ($remaining > 0) {
             $toRead = $remaining > $bufSize ? $bufSize : $remaining;
@@ -239,7 +212,7 @@ final class Parser
             $lastNl = strrpos($chunk, "\n");
             if ($lastNl === false) {
                 fseek($handle, -$chunkLen, SEEK_CUR);
-                $remaining += $chunkLen;
+//                $remaining += $chunkLen;
                 break;
             }
 
@@ -249,32 +222,40 @@ final class Parser
                 $remaining += $tail;
             }
 
-            $slugPos      = $prefixLen;
-            $safeZoneSlug = $lastNl - $safeZoneOffset + $prefixLen;
+            $p     = $prefixLen;
+            $fence = $lastNl - 720;
 
-            while ($slugPos < $safeZoneSlug) {
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $suffixLen;
+            while ($p < $fence) {
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
 
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $suffixLen;
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
 
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $suffixLen;
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
 
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $suffixLen;
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
             }
 
-            while ($slugPos < $lastNl) {
-                $nl = strpos($chunk, "\n", $slugPos + $slugHint);
-                if ($nl === false) break;
-                $buckets[$pathIds[substr($chunk, $slugPos, $nl - $slugPos - $suffixLen)]] .= $dateIdBytes[substr($chunk, $nl - 23, 8)];
-                $slugPos = $nl + $suffixLen;
+            while ($p < $lastNl) {
+                $sep = strpos($chunk, ',', $p);
+                if ($sep === false || $sep >= $lastNl) break;
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
             }
         }
 
