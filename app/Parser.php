@@ -22,6 +22,7 @@ use function ftell;
 use function fwrite;
 use function gc_disable;
 use function getmypid;
+use function implode;
 use function ini_set;
 use function min;
 use function pack;
@@ -39,13 +40,13 @@ use function unlink;
 use function unpack;
 
 use const SEEK_CUR;
+use const WNOHANG;
 
 final class Parser
 {
     private const int BUFFER_SIZE   = 163_840;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
-    private const int SUFFIX_LEN    = 26;
     private const int WORKERS       = 10;
 
     public function parse(string $inputPath, string $outputPath): void
@@ -60,7 +61,7 @@ final class Parser
         $dates     = [];
         $dateCount = 0;
 
-        for ($y = 20; $y <= 27; $y++) {
+        for ($y = 20; $y <= 26; $y++) {
             $yStr = (string)$y;
             for ($m = 1; $m <= 12; $m++) {
                 $maxD = match ($m) {
@@ -162,11 +163,13 @@ final class Parser
             $pathIds, $dateIdBytes, $pathCount, $dateCount,
         );
 
-        $n       = $pathCount * $dateCount;
         $pending = count($childMap);
 
         while ($pending > 0) {
-            $pid = pcntl_wait($status);
+            $pid = pcntl_wait($status, WNOHANG);
+            if ($pid <= 0) {
+                $pid = pcntl_wait($status);
+            }
             if (!isset($childMap[$pid])) continue;
 
             $tmpFile = $childMap[$pid];
@@ -212,7 +215,6 @@ final class Parser
             $lastNl = strrpos($chunk, "\n");
             if ($lastNl === false) {
                 fseek($handle, -$chunkLen, SEEK_CUR);
-//                $remaining += $chunkLen;
                 break;
             }
 
@@ -299,18 +301,17 @@ final class Parser
         $firstPath = true;
 
         for ($p = 0; $p < $pathCount; $p++) {
-            $base = $p * $dateCount;
-            $buf  = '';
-            $sep  = '';
+            $base        = $p * $dateCount;
+            $dateEntries = [];
 
             for ($d = 0; $d < $dateCount; $d++) {
                 $count = $counts[$base + $d];
-                if ($count === 0) continue;
-                $buf .= $sep . $datePrefixes[$d] . $count;
-                $sep  = ",\n";
+                if ($count !== 0) {
+                    $dateEntries[] = $datePrefixes[$d] . $count;
+                }
             }
 
-            if ($buf === '') continue;
+            if (empty($dateEntries)) continue;
 
             $sep2      = $firstPath ? '' : ',';
             $firstPath = false;
@@ -318,7 +319,7 @@ final class Parser
             fwrite($out,
                 $sep2 .
                 "\n    " . $escapedPaths[$p] . ": {\n" .
-                $buf .
+                implode(",\n", $dateEntries) .
                 "\n    }"
             );
         }
