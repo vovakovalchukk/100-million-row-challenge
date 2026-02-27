@@ -41,7 +41,7 @@ use const WNOHANG;
 
 final class Parser
 {
-    private const int BUFFER_SIZE   = 163_840;
+    private const int BUFFER_SIZE   = 786_432;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
     private const int WORKERS       = 10;
