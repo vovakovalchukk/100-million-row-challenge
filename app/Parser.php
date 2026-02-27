@@ -20,11 +20,14 @@ use function ftell;
 use function fwrite;
 use function gc_disable;
 use function getmypid;
+use function getrusage;
 use function implode;
+use function microtime;
 use function min;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
+use function sprintf;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
@@ -41,7 +44,7 @@ use const WNOHANG;
 
 final class Parser
 {
-    private const int BUFFER_SIZE   = 163_840;
+    private const int BUFFER_SIZE   = 786_432;
     private const int DISCOVER_SIZE = 2 * 1024 * 1024;
     private const int PREFIX_LEN    = 25;
     private const int WORKERS       = 10;
@@ -49,6 +52,8 @@ final class Parser
     public function parse($inputPath, $outputPath)
     {
         gc_disable();
+
+        $T0 = microtime(true);
 
         $fileSize   = filesize($inputPath);
         $numWorkers = self::WORKERS;
@@ -58,6 +63,7 @@ final class Parser
         $dateCount = 0;
 
         for ($y = 21; $y <= 26; $y++) {
+            $yStr = (string)$y;
             for ($m = 1; $m <= 12; $m++) {
                 $maxD = match ($m) {
                     2           => (($y + 2000) % 4 === 0) ? 29 : 28,
@@ -65,7 +71,7 @@ final class Parser
                     default     => 31,
                 };
                 $mStr  = ($m < 10 ? '0' : '') . $m;
-                $ymStr = $y . '-' . $mStr . '-';
+                $ymStr = $yStr . '-' . $mStr . '-';
                 for ($d = 1; $d <= $maxD; $d++) {
                     $key               = $ymStr . (($d < 10 ? '0' : '') . $d);
                     $dateIds[$key]     = $dateCount;
@@ -79,6 +85,8 @@ final class Parser
         foreach ($dateIds as $date => $id) {
             $dateIdBytes[$date] = chr($id & 0xFF) . chr($id >> 8);
         }
+
+        $T1 = microtime(true);
 
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
@@ -116,6 +124,8 @@ final class Parser
             }
         }
 
+        $T2 = microtime(true);
+
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
         for ($i = 1; $i < $numWorkers; $i++) {
@@ -140,7 +150,6 @@ final class Parser
                     $inputPath, $splitPoints[$w], $splitPoints[$w + 1],
                     $pathIds, $dateIdBytes, $pathCount, $dateCount,
                 );
-
                 file_put_contents($tmpFile, pack('v*', ...$wCounts));
                 exit(0);
             }
@@ -154,6 +163,8 @@ final class Parser
             $splitPoints[$numWorkers],
             $pathIds, $dateIdBytes, $pathCount, $dateCount,
         );
+
+        $T3 = microtime(true);
 
         $pending = count($childMap);
 
@@ -174,7 +185,27 @@ final class Parser
             $pending--;
         }
 
+        $T4 = microtime(true);
+
         $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
+
+        $T5 = microtime(true);
+
+        $ru = getrusage();
+
+        throw new \RuntimeException(sprintf(
+            "setup=%.3f discover=%.3f parse=%.3f merge=%.3f write=%.3f TOTAL=%.3f | CPU_usr=%.3f CPU_sys=%.3f | paths=%d dates=%d",
+            $T1-$T0,
+            $T2-$T1,
+            $T3-$T2,
+            $T4-$T3,
+            $T5-$T4,
+            $T5-$T0,
+            $ru['ru_utime.tv_sec'] + $ru['ru_utime.tv_usec']/1e6,
+            $ru['ru_stime.tv_sec'] + $ru['ru_stime.tv_usec']/1e6,
+            $pathCount,
+            $dateCount,
+        ));
     }
 
     private function processChunk($inputPath, $start, $end, $pathIds, $dateIdBytes, $pathCount, $dateCount)
