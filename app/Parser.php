@@ -28,6 +28,11 @@ use function min;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
+use function set_error_handler;
+use function shmop_delete;
+use function shmop_open;
+use function shmop_read;
+use function shmop_write;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
@@ -140,6 +145,28 @@ final class Parser
 
         file_put_contents($queueFile, pack('V', 0));
 
+        $shmSegSize = $pathCount * $dateCount * 2;
+        $shmHandles = [];
+        $useShm     = false;
+
+        $allOk = true;
+        for ($w = 0; $w < $numWorkers - 1; $w++) {
+            $shmKey = $myPid * 100 + $w;
+            set_error_handler(null);
+            $shm = @shmop_open($shmKey, 'c', 0644, $shmSegSize);
+            set_error_handler(null);
+            if ($shm === false) {
+                foreach ($shmHandles as [$k, $s]) {
+                    shmop_delete($s);
+                }
+                $shmHandles = [];
+                $allOk      = false;
+                break;
+            }
+            $shmHandles[$w] = [$shmKey, $shm];
+        }
+        $useShm = $allOk;
+
         $childMap = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
@@ -163,11 +190,18 @@ final class Parser
                 fclose($fh);
 
                 $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
-                file_put_contents($tmpFile, pack('v*', ...$counts));
+                $packed = pack('v*', ...$counts);
+
+                if ($useShm) {
+                    shmop_write($shmHandles[$w][1], $packed, 0);
+                } else {
+                    file_put_contents($tmpFile, $packed);
+                }
+
                 exit(0);
             }
 
-            $childMap[$pid] = $tmpFile;
+            $childMap[$pid] = $w;
         }
 
         $buckets = array_fill(0, $pathCount, '');
@@ -190,11 +224,19 @@ final class Parser
             $pid = pcntl_wait($status);
             if (!isset($childMap[$pid])) continue;
 
-            $tmpFile     = $childMap[$pid];
-            $childCounts = unpack('v*', file_get_contents($tmpFile));
-            unlink($tmpFile);
+            $w = $childMap[$pid];
             unset($childMap[$pid]);
 
+            if ($useShm) {
+                $packed      = shmop_read($shmHandles[$w][1], 0, $shmSegSize);
+                shmop_delete($shmHandles[$w][1]);
+            } else {
+                $tmpFile = $tmpPrefix . '_' . $w;
+                $packed  = file_get_contents($tmpFile);
+                unlink($tmpFile);
+            }
+
+            $childCounts = unpack('v*', $packed);
             $j = 0;
             foreach ($childCounts as $v) {
                 $counts[$j++] += $v;
