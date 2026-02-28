@@ -9,10 +9,12 @@ use function array_fill;
 use function chr;
 use function count;
 use function fclose;
+use function fflush;
 use function fgets;
 use function file_get_contents;
 use function file_put_contents;
 use function filesize;
+use function flock;
 use function fopen;
 use function fread;
 use function fseek;
@@ -21,6 +23,7 @@ use function fwrite;
 use function gc_disable;
 use function getmypid;
 use function implode;
+use function intdiv;
 use function min;
 use function pack;
 use function pcntl_fork;
@@ -36,15 +39,17 @@ use function sys_get_temp_dir;
 use function unlink;
 use function unpack;
 
+use const LOCK_EX;
+use const LOCK_UN;
 use const SEEK_CUR;
-use const WNOHANG;
 
 final class Parser
 {
-    private const int BUFFER_SIZE   = 163_840;
-    private const int DISCOVER_SIZE = 2 * 1024 * 1024;
-    private const int PREFIX_LEN    = 25;
-    private const int WORKERS       = 10;
+    private const int BUFFER_SIZE = 163_840;
+    private const int DISC_SIZE   = 2_097_152;
+    private const int PREFIX_LEN  = 25;
+    private const int WORKERS     = 16;
+    private const int CHUNKS      = 32;
 
     public function parse($inputPath, $outputPath)
     {
@@ -52,20 +57,22 @@ final class Parser
 
         $fileSize   = filesize($inputPath);
         $numWorkers = self::WORKERS;
+        $numChunks  = self::CHUNKS;
 
         $dateIds   = [];
         $dates     = [];
         $dateCount = 0;
 
         for ($y = 21; $y <= 26; $y++) {
+            $yStr = (string)$y;
             for ($m = 1; $m <= 12; $m++) {
                 $maxD = match ($m) {
-                    2           => (($y + 2000) % 4 === 0) ? 29 : 28,
+                    2           => $y === 24 ? 29 : 28,
                     4, 6, 9, 11 => 30,
                     default     => 31,
                 };
                 $mStr  = ($m < 10 ? '0' : '') . $m;
-                $ymStr = $y . '-' . $mStr . '-';
+                $ymStr = $yStr . '-' . $mStr . '-';
                 for ($d = 1; $d <= $maxD; $d++) {
                     $key               = $ymStr . (($d < 10 ? '0' : '') . $d);
                     $dateIds[$key]     = $dateCount;
@@ -82,7 +89,7 @@ final class Parser
 
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
-        $raw = fread($handle, min(self::DISCOVER_SIZE, $fileSize));
+        $raw = fread($handle, min(self::DISC_SIZE, $fileSize));
         fclose($handle);
 
         $pathIds   = [];
@@ -118,96 +125,126 @@ final class Parser
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
-        for ($i = 1; $i < $numWorkers; $i++) {
-            fseek($bh, (int)($fileSize * $i / $numWorkers));
+        for ($i = 1; $i < $numChunks; $i++) {
+            fseek($bh, intdiv($fileSize * $i, $numChunks));
             fgets($bh);
             $splitPoints[] = ftell($bh);
         }
         fclose($bh);
         $splitPoints[] = $fileSize;
 
-        $tmpDir   = sys_get_temp_dir();
-        $myPid    = getmypid();
+        $tmpDir    = sys_get_temp_dir();
+        $myPid     = getmypid();
+        $tmpPrefix = $tmpDir . '/p100m_' . $myPid;
+        $queueFile = $tmpPrefix . '_queue';
+
+        file_put_contents($queueFile, pack('V', 0));
+
         $childMap = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
-            $tmpFile = $tmpDir . '/p100m_' . $myPid . '_' . $w;
+            $tmpFile = $tmpPrefix . '_' . $w;
             $pid     = pcntl_fork();
             if ($pid === -1) throw new \RuntimeException('pcntl_fork failed');
 
             if ($pid === 0) {
-                $wCounts = $this->processChunk(
-                    $inputPath, $splitPoints[$w], $splitPoints[$w + 1],
-                    $pathIds, $dateIdBytes, $pathCount, $dateCount,
-                );
+                $buckets = array_fill(0, $pathCount, '');
+                $fh      = fopen($inputPath, 'rb');
+                stream_set_read_buffer($fh, 0);
+                $qf      = fopen($queueFile, 'c+b');
 
-                file_put_contents($tmpFile, pack('v*', ...$wCounts));
+                while (true) {
+                    $ci = $this->grabChunk($qf, $numChunks);
+                    if ($ci === -1) break;
+                    $this->fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+                }
+
+                fclose($qf);
+                fclose($fh);
+
+                $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
+                file_put_contents($tmpFile, pack('v*', ...$counts));
                 exit(0);
             }
 
             $childMap[$pid] = $tmpFile;
         }
 
-        $counts = $this->processChunk(
-            $inputPath,
-            $splitPoints[$numWorkers - 1],
-            $splitPoints[$numWorkers],
-            $pathIds, $dateIdBytes, $pathCount, $dateCount,
-        );
+        $buckets = array_fill(0, $pathCount, '');
+        $fh      = fopen($inputPath, 'rb');
+        stream_set_read_buffer($fh, 0);
+        $qf      = fopen($queueFile, 'c+b');
 
-        $pending = count($childMap);
+        while (true) {
+            $ci = $this->grabChunk($qf, $numChunks);
+            if ($ci === -1) break;
+            $this->fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+        }
 
-        while ($pending > 0) {
-            $pid = pcntl_wait($status, WNOHANG);
-            if ($pid <= 0) {
-                $pid = pcntl_wait($status);
-            }
+        fclose($qf);
+        fclose($fh);
+
+        $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
+
+        while ($childMap) {
+            $pid = pcntl_wait($status);
             if (!isset($childMap[$pid])) continue;
 
-            $tmpFile = $childMap[$pid];
-            $wCounts = unpack('v*', file_get_contents($tmpFile));
+            $tmpFile     = $childMap[$pid];
+            $childCounts = unpack('v*', file_get_contents($tmpFile));
             unlink($tmpFile);
+            unset($childMap[$pid]);
+
             $j = 0;
-            foreach ($wCounts as $v) {
+            foreach ($childCounts as $v) {
                 $counts[$j++] += $v;
             }
-            $pending--;
         }
+
+        unlink($queueFile);
 
         $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private function processChunk($inputPath, $start, $end, $pathIds, $dateIdBytes, $pathCount, $dateCount)
+    private function grabChunk($qf, $numChunks)
     {
-        $buckets   = array_fill(0, $pathCount, '');
-        $handle    = fopen($inputPath, 'rb');
-        $remaining = $end - $start;
+        flock($qf, LOCK_EX);
+        fseek($qf, 0);
+        $idx = unpack('V', fread($qf, 4))[1];
+        if ($idx >= $numChunks) {
+            flock($qf, LOCK_UN);
+            return -1;
+        }
+        fseek($qf, 0);
+        fwrite($qf, pack('V', $idx + 1));
+        fflush($qf);
+        flock($qf, LOCK_UN);
+        return $idx;
+    }
 
-        stream_set_read_buffer($handle, 0);
+    private function fillBuckets($handle, $start, $end, $pathIds, $dateIdBytes, &$buckets)
+    {
         fseek($handle, $start);
 
+        $processed = 0;
+        $toProcess = $end - $start;
         $bufSize   = self::BUFFER_SIZE;
         $prefixLen = self::PREFIX_LEN;
 
-        while ($remaining > 0) {
-            $toRead = $remaining > $bufSize ? $bufSize : $remaining;
-            $chunk  = fread($handle, $toRead);
-            if ($chunk === false || $chunk === '') break;
+        while ($processed < $toProcess) {
+            $remaining = $toProcess - $processed;
+            $chunk     = fread($handle, $remaining > $bufSize ? $bufSize : $remaining);
+            if (!$chunk) break;
 
-            $chunkLen   = strlen($chunk);
-            $remaining -= $chunkLen;
-
-            $lastNl = strrpos($chunk, "\n");
-            if ($lastNl === false) {
-                fseek($handle, -$chunkLen, SEEK_CUR);
-                break;
-            }
+            $chunkLen = strlen($chunk);
+            $lastNl   = strrpos($chunk, "\n");
+            if ($lastNl === false) continue;
 
             $tail = $chunkLen - $lastNl - 1;
             if ($tail > 0) {
                 fseek($handle, -$tail, SEEK_CUR);
-                $remaining += $tail;
             }
+            $processed += $lastNl + 1;
 
             $p     = $prefixLen;
             $fence = $lastNl - 720;
@@ -245,25 +282,27 @@ final class Parser
                 $p = $sep + 52;
             }
         }
+    }
 
-        fclose($handle);
-
+    private function bucketsToCounts(&$buckets, $pathCount, $dateCount)
+    {
         $counts = array_fill(0, $pathCount * $dateCount, 0);
-        for ($p = 0; $p < $pathCount; $p++) {
-            if ($buckets[$p] === '') continue;
-            $offset = $p * $dateCount;
-            foreach (array_count_values(unpack('v*', $buckets[$p])) as $did => $cnt) {
-                $counts[$offset + $did] += $cnt;
+        $base   = 0;
+        foreach ($buckets as $bucket) {
+            if ($bucket !== '') {
+                foreach (array_count_values(unpack('v*', $bucket)) as $did => $cnt) {
+                    $counts[$base + $did] += $cnt;
+                }
             }
+            $base += $dateCount;
         }
-
         return $counts;
     }
 
     private function writeJson($outputPath, $counts, $paths, $dates, $dateCount)
     {
         $out = fopen($outputPath, 'wb');
-        stream_set_write_buffer($out, 1024 * 1024);
+        stream_set_write_buffer($out, 1_048_576);
 
         $pathCount    = count($paths);
         $datePrefixes = [];
@@ -279,9 +318,9 @@ final class Parser
 
         fwrite($out, '{');
         $firstPath = true;
+        $base      = 0;
 
         for ($p = 0; $p < $pathCount; $p++) {
-            $base        = $p * $dateCount;
             $dateEntries = [];
 
             for ($d = 0; $d < $dateCount; $d++) {
@@ -291,7 +330,10 @@ final class Parser
                 }
             }
 
-            if (empty($dateEntries)) continue;
+            if (empty($dateEntries)) {
+                $base += $dateCount;
+                continue;
+            }
 
             $sep2      = $firstPath ? '' : ',';
             $firstPath = false;
@@ -302,6 +344,8 @@ final class Parser
                 implode(",\n", $dateEntries) .
                 "\n    }"
             );
+
+            $base += $dateCount;
         }
 
         fwrite($out, "\n}");
