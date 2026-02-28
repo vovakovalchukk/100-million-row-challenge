@@ -48,8 +48,8 @@ final class Parser
     private const int BUFFER_SIZE = 163_840;
     private const int DISC_SIZE   = 2_097_152;
     private const int PREFIX_LEN  = 25;
-    private const int WORKERS     = 8;
-    private const int CHUNKS      = 16;
+    private const int WORKERS     = 10;
+    private const int CHUNKS      = 20;
 
     public function parse($inputPath, $outputPath)
     {
