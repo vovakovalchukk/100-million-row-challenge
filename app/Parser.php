@@ -24,6 +24,7 @@ use function gc_disable;
 use function getmypid;
 use function implode;
 use function intdiv;
+use function min;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
@@ -45,11 +46,12 @@ use const SEEK_CUR;
 final class Parser
 {
     private const int BUFFER_SIZE = 163_840;
+    private const int DISC_SIZE   = 2_097_152;
     private const int PREFIX_LEN  = 25;
     private const int WORKERS     = 8;
     private const int CHUNKS      = 16;
 
-    public static function parse($inputPath, $outputPath)
+    public function parse($inputPath, $outputPath)
     {
         gc_disable();
 
@@ -85,9 +87,32 @@ final class Parser
             $dateIdBytes[$date] = chr($id & 0xFF) . chr($id >> 8);
         }
 
+        $handle = fopen($inputPath, 'rb');
+        stream_set_read_buffer($handle, 0);
+        $raw = fread($handle, min(self::DISC_SIZE, $fileSize));
+        fclose($handle);
+
         $pathIds   = [];
         $paths     = [];
         $pathCount = 0;
+        $pos       = 0;
+        $lastNl    = strrpos($raw, "\n") ?: 0;
+
+        while ($pos < $lastNl) {
+            $nl = strpos($raw, "\n", $pos + 52);
+            if ($nl === false) break;
+
+            $slug = substr($raw, $pos + self::PREFIX_LEN, $nl - $pos - 51);
+
+            if (!isset($pathIds[$slug])) {
+                $pathIds[$slug]    = $pathCount;
+                $paths[$pathCount] = $slug;
+                $pathCount++;
+            }
+
+            $pos = $nl + 1;
+        }
+        unset($raw);
 
         foreach (Visit::all() as $visit) {
             $slug = substr($visit->uri, self::PREFIX_LEN);
@@ -129,15 +154,15 @@ final class Parser
                 $qf      = fopen($queueFile, 'c+b');
 
                 while (true) {
-                    $ci = self::grabChunk($qf, $numChunks);
+                    $ci = $this->grabChunk($qf, $numChunks);
                     if ($ci === -1) break;
-                    self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+                    $this->fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
                 }
 
                 fclose($qf);
                 fclose($fh);
 
-                $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
+                $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
                 file_put_contents($tmpFile, pack('v*', ...$counts));
                 exit(0);
             }
@@ -151,15 +176,15 @@ final class Parser
         $qf      = fopen($queueFile, 'c+b');
 
         while (true) {
-            $ci = self::grabChunk($qf, $numChunks);
+            $ci = $this->grabChunk($qf, $numChunks);
             if ($ci === -1) break;
-            self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+            $this->fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
         }
 
         fclose($qf);
         fclose($fh);
 
-        $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
+        $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
 
         while ($childMap) {
             $pid = pcntl_wait($status);
@@ -178,10 +203,10 @@ final class Parser
 
         unlink($queueFile);
 
-        self::writeJson($outputPath, $counts, $paths, $dates, $dateCount);
+        $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private static function grabChunk($qf, $numChunks)
+    private function grabChunk($qf, $numChunks)
     {
         flock($qf, LOCK_EX);
         fseek($qf, 0);
@@ -197,7 +222,7 @@ final class Parser
         return $idx;
     }
 
-    private static function fillBuckets($handle, $start, $end, $pathIds, $dateIdBytes, &$buckets)
+    private function fillBuckets($handle, $start, $end, $pathIds, $dateIdBytes, &$buckets)
     {
         fseek($handle, $start);
 
@@ -259,7 +284,7 @@ final class Parser
         }
     }
 
-    private static function bucketsToCounts(&$buckets, $pathCount, $dateCount)
+    private function bucketsToCounts(&$buckets, $pathCount, $dateCount)
     {
         $counts = array_fill(0, $pathCount * $dateCount, 0);
         $base   = 0;
@@ -274,7 +299,7 @@ final class Parser
         return $counts;
     }
 
-    private static function writeJson($outputPath, $counts, $paths, $dates, $dateCount)
+    private function writeJson($outputPath, $counts, $paths, $dates, $dateCount)
     {
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, 1_048_576);
