@@ -9,12 +9,10 @@ use function array_fill;
 use function chr;
 use function count;
 use function fclose;
-use function fflush;
 use function fgets;
 use function file_get_contents;
 use function file_put_contents;
 use function filesize;
-use function flock;
 use function fopen;
 use function fread;
 use function fseek;
@@ -28,6 +26,10 @@ use function min;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
+use function sem_acquire;
+use function sem_get;
+use function sem_release;
+use function sem_remove;
 use function set_error_handler;
 use function shmop_delete;
 use function shmop_open;
@@ -44,8 +46,6 @@ use function sys_get_temp_dir;
 use function unlink;
 use function unpack;
 
-use const LOCK_EX;
-use const LOCK_UN;
 use const SEEK_CUR;
 
 final class Parser
@@ -141,9 +141,6 @@ final class Parser
         $tmpDir    = sys_get_temp_dir();
         $myPid     = getmypid();
         $tmpPrefix = $tmpDir . '/p100m_' . $myPid;
-        $queueFile = $tmpPrefix . '_queue';
-
-        file_put_contents($queueFile, pack('V', 0));
 
         $shmSegSize = $pathCount * $dateCount * 2;
         $shmHandles = [];
@@ -167,6 +164,25 @@ final class Parser
         }
         $useShm = $allOk;
 
+        $useSemQueue = false;
+        $semKey      = $myPid + 1;
+        $queueShmKey = $myPid + 2;
+        $queueShm    = null;
+        $sem         = null;
+
+        set_error_handler(null);
+        $sem      = @sem_get($semKey, 1, 0644, true);
+        $queueShm = @shmop_open($queueShmKey, 'c', 0644, 4);
+        set_error_handler(null);
+
+        if ($sem !== false && $queueShm !== false) {
+            shmop_write($queueShm, pack('V', 0), 0);
+            $useSemQueue = true;
+        } else {
+            $queueFile = $tmpPrefix . '_queue';
+            file_put_contents($queueFile, pack('V', 0));
+        }
+
         $childMap = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
@@ -178,15 +194,23 @@ final class Parser
                 $buckets = array_fill(0, $pathCount, '');
                 $fh      = fopen($inputPath, 'rb');
                 stream_set_read_buffer($fh, 0);
-                $qf      = fopen($queueFile, 'c+b');
 
-                while (true) {
-                    $ci = self::grabChunk($qf, $numChunks);
-                    if ($ci === -1) break;
-                    self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+                if ($useSemQueue) {
+                    while (true) {
+                        $ci = self::grabChunkSem($queueShm, $sem, $numChunks);
+                        if ($ci === -1) break;
+                        self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+                    }
+                } else {
+                    $qf = fopen($queueFile, 'c+b');
+                    while (true) {
+                        $ci = self::grabChunkFlock($qf, $numChunks);
+                        if ($ci === -1) break;
+                        self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+                    }
+                    fclose($qf);
                 }
 
-                fclose($qf);
                 fclose($fh);
 
                 $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
@@ -207,18 +231,27 @@ final class Parser
         $buckets = array_fill(0, $pathCount, '');
         $fh      = fopen($inputPath, 'rb');
         stream_set_read_buffer($fh, 0);
-        $qf      = fopen($queueFile, 'c+b');
 
-        while (true) {
-            $ci = self::grabChunk($qf, $numChunks);
-            if ($ci === -1) break;
-            self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+        if ($useSemQueue) {
+            while (true) {
+                $ci = self::grabChunkSem($queueShm, $sem, $numChunks);
+                if ($ci === -1) break;
+                self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+            }
+        } else {
+            $qf = fopen($queueFile, 'c+b');
+            while (true) {
+                $ci = self::grabChunkFlock($qf, $numChunks);
+                if ($ci === -1) break;
+                self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+            }
+            fclose($qf);
         }
 
-        fclose($qf);
         fclose($fh);
 
         $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
+        $n      = $pathCount * $dateCount;
 
         while ($childMap) {
             $pid = pcntl_wait($status);
@@ -237,18 +270,35 @@ final class Parser
             }
 
             $childCounts = unpack('v*', $packed);
-            $j = 0;
-            foreach ($childCounts as $v) {
-                $counts[$j++] += $v;
+            for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
+                $counts[$j] += $childCounts[$k];
             }
         }
 
-        unlink($queueFile);
+        if ($useSemQueue) {
+            shmop_delete($queueShm);
+            sem_remove($sem);
+        } else {
+            unlink($queueFile);
+        }
 
         self::writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private static function grabChunk($qf, $numChunks)
+    private static function grabChunkSem($queueShm, $sem, $numChunks)
+    {
+        sem_acquire($sem);
+        $idx = unpack('V', shmop_read($queueShm, 0, 4))[1];
+        if ($idx >= $numChunks) {
+            sem_release($sem);
+            return -1;
+        }
+        shmop_write($queueShm, pack('V', $idx + 1), 0);
+        sem_release($sem);
+        return $idx;
+    }
+
+    private static function grabChunkFlock($qf, $numChunks)
     {
         flock($qf, LOCK_EX);
         fseek($qf, 0);
@@ -268,25 +318,26 @@ final class Parser
     {
         fseek($handle, $start);
 
-        $processed = 0;
-        $toProcess = $end - $start;
+        $remaining = $end - $start;
         $bufSize   = self::BUFFER_SIZE;
         $prefixLen = self::PREFIX_LEN;
 
-        while ($processed < $toProcess) {
-            $remaining = $toProcess - $processed;
-            $chunk     = fread($handle, $remaining > $bufSize ? $bufSize : $remaining);
+        while ($remaining > 0) {
+            $toRead = $remaining > $bufSize ? $bufSize : $remaining;
+            $chunk  = fread($handle, $toRead);
             if (!$chunk) break;
 
-            $chunkLen = strlen($chunk);
-            $lastNl   = strrpos($chunk, "\n");
+            $chunkLen   = strlen($chunk);
+            $remaining -= $chunkLen;
+
+            $lastNl = strrpos($chunk, "\n");
             if ($lastNl === false) continue;
 
             $tail = $chunkLen - $lastNl - 1;
             if ($tail > 0) {
                 fseek($handle, -$tail, SEEK_CUR);
+                $remaining += $tail;
             }
-            $processed += $lastNl + 1;
 
             $p     = $prefixLen;
             $fence = $lastNl - 594;
