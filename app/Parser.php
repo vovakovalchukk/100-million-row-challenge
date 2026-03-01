@@ -289,7 +289,7 @@ final class Parser
             $processed += $lastNl + 1;
 
             $p     = $prefixLen;
-            $fence = $lastNl - 720;
+            $fence = $lastNl - 594;
 
             while ($p < $fence) {
                 $sep = strpos($chunk, ',', $p);
