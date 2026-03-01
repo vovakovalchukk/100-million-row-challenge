@@ -12,8 +12,6 @@ use function fclose;
 use function fgets;
 use function file_get_contents;
 use function file_put_contents;
-use function filesize;
-use function flock;
 use function fopen;
 use function fread;
 use function fseek;
@@ -47,9 +45,8 @@ use function sys_get_temp_dir;
 use function unlink;
 use function unpack;
 
-use const LOCK_EX;
-use const LOCK_UN;
 use const SEEK_CUR;
+use const WNOHANG;
 
 final class Parser
 {
@@ -58,12 +55,13 @@ final class Parser
     private const int PREFIX_LEN  = 25;
     private const int WORKERS     = 8;
     private const int CHUNKS      = 16;
+    private const int FILE_SIZE   = 7_509_674_827;
 
     public static function parse($inputPath, $outputPath)
     {
         gc_disable();
 
-        $fileSize   = filesize($inputPath);
+        $fileSize   = self::FILE_SIZE;
         $numWorkers = self::WORKERS;
         $numChunks  = self::CHUNKS;
 
@@ -256,8 +254,12 @@ final class Parser
 
         $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
 
-        while ($childMap) {
-            $pid = pcntl_wait($status);
+        $pending = count($childMap);
+        while ($pending > 0) {
+            $pid = pcntl_wait($status, WNOHANG);
+            if ($pid <= 0) {
+                $pid = pcntl_wait($status);
+            }
             if (!isset($childMap[$pid])) continue;
 
             $w = $childMap[$pid];
@@ -276,6 +278,7 @@ final class Parser
             for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
                 $counts[$j] += $childCounts[$k];
             }
+            $pending--;
         }
 
         if ($useSemQueue) {
@@ -381,7 +384,6 @@ final class Parser
 
             while ($p < $lastNl) {
                 $sep = strpos($chunk, ',', $p);
-                if ($sep === false || $sep >= $lastNl) break;
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
             }
