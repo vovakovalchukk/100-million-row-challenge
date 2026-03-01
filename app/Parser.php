@@ -20,8 +20,6 @@ use function fwrite;
 use function gc_disable;
 use function getmypid;
 use function implode;
-use function intdiv;
-use function min;
 use function pack;
 use function pcntl_fork;
 use function pcntl_wait;
@@ -95,7 +93,7 @@ final class Parser
 
         $handle = fopen($inputPath, 'rb');
         stream_set_read_buffer($handle, 0);
-        $raw = fread($handle, min(self::DISC_SIZE, $fileSize));
+        $raw = fread($handle, self::DISC_SIZE);
         fclose($handle);
 
         $pathIds   = [];
@@ -131,8 +129,24 @@ final class Parser
 
         $splitPoints = [0];
         $bh = fopen($inputPath, 'rb');
-        for ($i = 1; $i < $numChunks; $i++) {
-            fseek($bh, intdiv($fileSize * $i, $numChunks));
+        foreach ([
+                     469_354_676,
+                     938_709_353,
+                     1_408_064_029,
+                     1_877_418_706,
+                     2_346_773_382,
+                     2_816_128_059,
+                     3_285_482_735,
+                     3_754_837_412,
+                     4_224_192_088,
+                     4_693_546_765,
+                     5_162_901_441,
+                     5_632_256_118,
+                     6_101_610_794,
+                     6_570_965_471,
+                     7_040_320_147
+                 ] as $offset) {
+            fseek($bh, $offset);
             fgets($bh);
             $splitPoints[] = ftell($bh);
         }
@@ -275,8 +289,9 @@ final class Parser
             }
 
             $childCounts = unpack('v*', $packed);
-            for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
-                $counts[$j] += $childCounts[$k];
+            $j = 0;
+            foreach ($childCounts as $v) {
+                $counts[$j++] += $v;
             }
             $pending--;
         }
