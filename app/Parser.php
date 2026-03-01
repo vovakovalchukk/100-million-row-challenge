@@ -56,7 +56,7 @@ final class Parser
     private const int WORKERS     = 8;
     private const int CHUNKS      = 16;
 
-    public function parse($inputPath, $outputPath)
+    public static function parse($inputPath, $outputPath)
     {
         gc_disable();
 
@@ -181,15 +181,15 @@ final class Parser
                 $qf      = fopen($queueFile, 'c+b');
 
                 while (true) {
-                    $ci = $this->grabChunk($qf, $numChunks);
+                    $ci = self::grabChunk($qf, $numChunks);
                     if ($ci === -1) break;
-                    $this->fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+                    self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
                 }
 
                 fclose($qf);
                 fclose($fh);
 
-                $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
+                $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
                 $packed = pack('v*', ...$counts);
 
                 if ($useShm) {
@@ -210,15 +210,15 @@ final class Parser
         $qf      = fopen($queueFile, 'c+b');
 
         while (true) {
-            $ci = $this->grabChunk($qf, $numChunks);
+            $ci = self::grabChunk($qf, $numChunks);
             if ($ci === -1) break;
-            $this->fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
+            self::fillBuckets($fh, $splitPoints[$ci], $splitPoints[$ci + 1], $pathIds, $dateIdBytes, $buckets);
         }
 
         fclose($qf);
         fclose($fh);
 
-        $counts = $this->bucketsToCounts($buckets, $pathCount, $dateCount);
+        $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
 
         while ($childMap) {
             $pid = pcntl_wait($status);
@@ -228,7 +228,7 @@ final class Parser
             unset($childMap[$pid]);
 
             if ($useShm) {
-                $packed      = shmop_read($shmHandles[$w][1], 0, $shmSegSize);
+                $packed = shmop_read($shmHandles[$w][1], 0, $shmSegSize);
                 shmop_delete($shmHandles[$w][1]);
             } else {
                 $tmpFile = $tmpPrefix . '_' . $w;
@@ -245,10 +245,10 @@ final class Parser
 
         unlink($queueFile);
 
-        $this->writeJson($outputPath, $counts, $paths, $dates, $dateCount);
+        self::writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private function grabChunk($qf, $numChunks)
+    private static function grabChunk($qf, $numChunks)
     {
         flock($qf, LOCK_EX);
         fseek($qf, 0);
@@ -264,7 +264,7 @@ final class Parser
         return $idx;
     }
 
-    private function fillBuckets($handle, $start, $end, $pathIds, $dateIdBytes, &$buckets)
+    private static function fillBuckets($handle, $start, $end, $pathIds, $dateIdBytes, &$buckets)
     {
         fseek($handle, $start);
 
@@ -326,7 +326,7 @@ final class Parser
         }
     }
 
-    private function bucketsToCounts(&$buckets, $pathCount, $dateCount)
+    private static function bucketsToCounts(&$buckets, $pathCount, $dateCount)
     {
         $counts = array_fill(0, $pathCount * $dateCount, 0);
         $base   = 0;
@@ -341,7 +341,7 @@ final class Parser
         return $counts;
     }
 
-    private function writeJson($outputPath, $counts, $paths, $dates, $dateCount)
+    private static function writeJson($outputPath, $counts, $paths, $dates, $dateCount)
     {
         $out = fopen($outputPath, 'wb');
         stream_set_write_buffer($out, 1_048_576);
