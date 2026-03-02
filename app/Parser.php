@@ -49,7 +49,7 @@ use const WNOHANG;
 final class Parser
 {
     private const int BUFFER_SIZE = 163_840;
-    private const int DISC_SIZE   = 2_097_152;
+    private const int DISC_SIZE   = 131_072;
     private const int PREFIX_LEN  = 25;
     private const int WORKERS     = 8;
     private const int CHUNKS      = 16;
@@ -103,18 +103,15 @@ final class Parser
         $lastNl    = strrpos($raw, "\n") ?: 0;
 
         while ($pos < $lastNl) {
-            $nl = strpos($raw, "\n", $pos + 52);
-            if ($nl === false) break;
-
-            $slug = substr($raw, $pos + self::PREFIX_LEN, $nl - $pos - 51);
-
+            $sep  = strpos($raw, ',', $pos + self::PREFIX_LEN);
+            if ($sep === false) break;
+            $slug = substr($raw, $pos + self::PREFIX_LEN, $sep - $pos - self::PREFIX_LEN);
             if (!isset($pathIds[$slug])) {
                 $pathIds[$slug]    = $pathCount;
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
-
-            $pos = $nl + 1;
+            $pos = $sep + 27;
         }
         unset($raw);
 
@@ -144,7 +141,7 @@ final class Parser
                      5_632_256_118,
                      6_101_610_794,
                      6_570_965_471,
-                     7_040_320_147
+                     7_040_320_147,
                  ] as $offset) {
             fseek($bh, $offset);
             fgets($bh);
@@ -289,8 +286,9 @@ final class Parser
             }
 
             $childCounts = unpack('v*', $packed);
-            for ($j = 0, $k = 1; $j < $n; $j++, $k++) {
-                $counts[$j] += $childCounts[$k];
+            $j = 0;
+            foreach ($childCounts as $v) {
+                $counts[$j++] += $v;
             }
             $pending--;
         }
